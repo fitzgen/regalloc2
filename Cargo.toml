@@ -1,5 +1,7 @@
 [workspace]
 members = ["regalloc2-tool"]
+# `regicide/` is its own workspace root, checked out here as a git worktree.
+exclude = ["regicide"]
 
 [package]
 name = "regalloc2"
@@ -31,6 +33,13 @@ arbtest = { version = "0.3.2", optional = true }
 bumpalo = { version = "3.16.0", features = ["allocator-api2"] }
 allocator-api2 = { version = "0.2.18", default-features = false, features = ["alloc"] }
 
+# The `regicide` register allocator, reachable through `Algorithm::Regicide`.
+regicide = { path = "regicide", optional = true, default-features = false, features = [
+    "hashbrown",
+    "entity-repr-8",
+    "entity-repr-16",
+] }
+
 # When testing regalloc2 by itself, enable debug assertions and overflow checks.
 [profile.release]
 debug = true
@@ -48,10 +57,13 @@ std = []
 checker = []
 
 # Enables detailed logging which can be somewhat expensive.
-trace-log = []
+trace-log = ["regicide?/trace-log"]
+
+# Enables the `regicide` register allocator as `Algorithm::Regicide`.
+regicide = ["dep:regicide"]
 
 # Exposes the internal API for fuzzing.
-fuzzing = ["arbitrary", "arbtest", "checker", "trace-log"]
+fuzzing = ["arbitrary", "arbtest", "checker", "trace-log", "regicide"]
 
 # Enables serde for exposed types.
 enable-serde = ["serde"]

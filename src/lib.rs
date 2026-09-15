@@ -64,6 +64,9 @@ pub mod checker;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 
+#[cfg(feature = "regicide")]
+pub(crate) mod regicide;
+
 #[cfg(feature = "enable-serde")]
 pub mod serialize;
 

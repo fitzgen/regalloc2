@@ -568,6 +568,11 @@ pub struct Ctx {
     pub(crate) scratch_workqueue_set: FxHashSet<Block>,
 
     pub(crate) scratch_bump: UnsafeSendSync<Bump>,
+
+    // The scratch space `Algorithm::Regicide` runs out of, reused across runs
+    // the same way everything above is.
+    #[cfg(feature = "regicide")]
+    pub(crate) regicide: crate::regicide::RegicideCtx,
 }
 
 const _ASSERT_SEND_SYNC: () = {
@@ -629,6 +634,9 @@ impl Default for Ctx {
             scratch_removed_lrs: Default::default(),
             scratch_removed_lrs_vregs: Default::default(),
             scratch_workqueue_set: Default::default(),
+
+            #[cfg(feature = "regicide")]
+            regicide: Default::default(),
         }
     }
 }
