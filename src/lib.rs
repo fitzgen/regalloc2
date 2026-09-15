@@ -1242,6 +1242,18 @@ pub trait Function {
     /// Get the block parameters for a given block.
     fn block_params(&self, block: Block) -> &[VReg];
 
+    /// Get the estimated frequency with which a block is executed.
+    ///
+    /// Only [`Algorithm::Regicide`] consults this; ion and fastalloc infer
+    /// what they need from loop depth. The default answer,
+    /// [`BlockFrequency::NORMAL`][::regicide::BlockFrequency::NORMAL], says
+    /// nothing and costs nothing, so an implementor with no profile
+    /// information can leave it alone.
+    #[cfg(feature = "regicide")]
+    fn block_frequency(&self, _block: Block) -> ::regicide::BlockFrequency {
+        ::regicide::BlockFrequency::default()
+    }
+
     /// Determine whether an instruction is a return instruction.
     fn is_ret(&self, insn: Inst) -> bool;
 
@@ -1673,6 +1685,22 @@ pub enum RegAllocError {
     /// Too many operands on a single instruction (beyond limit of
     /// 2^16 - 1).
     TooManyOperands,
+    /// regicide refused to allocate the function.
+    ///
+    /// Carried as rendered text rather than as a `regicide::Error` because
+    /// this enum derives `Deserialize` under `enable-serde`, and a
+    /// `regicide::Error` cannot be reconstructed from its serialized form.
+    #[cfg(feature = "regicide")]
+    Regicide(alloc::string::String),
+    /// The regicide shim could not express regicide's answer in this crate's
+    /// interface.
+    ///
+    /// Always a bug rather than a property of the input: the shim relies on
+    /// this crate's CFG validation to rule out everything regicide can emit
+    /// that [`Edit`] cannot represent, so reaching this means that reasoning
+    /// is wrong.
+    #[cfg(feature = "regicide")]
+    RegicideShim(alloc::string::String),
 }
 
 impl core::fmt::Display for RegAllocError {
@@ -1698,6 +1726,12 @@ pub fn run<F: Function>(
         Algorithm::Fastalloc => {
             fastalloc::run(func, env, options.verbose_log, options.validate_ssa)
         }
+        #[cfg(feature = "regicide")]
+        Algorithm::Regicide => {
+            let mut ctx = Ctx::default();
+            run_with_ctx(func, env, options, &mut ctx)?;
+            Ok(ctx.output)
+        }
     }
 }
 
@@ -1715,6 +1749,8 @@ pub fn run_with_ctx<'a, F: Function>(
         Algorithm::Fastalloc => {
             ctx.output = fastalloc::run(func, env, options.verbose_log, options.validate_ssa)?
         }
+        #[cfg(feature = "regicide")]
+        Algorithm::Regicide => regicide::run(func, env, options, ctx)?,
     }
     Ok(&ctx.output)
 }
@@ -1724,6 +1760,9 @@ pub enum Algorithm {
     #[default]
     Ion,
     Fastalloc,
+    /// The `regicide` allocator, reached through this crate's shim around it.
+    #[cfg(feature = "regicide")]
+    Regicide,
 }
 
 /// Options for allocation.
@@ -1737,6 +1776,12 @@ pub struct RegallocOptions {
 
     /// The register allocation algorithm to be used.
     pub algorithm: Algorithm,
+
+    /// How much effort regicide should put into removing redundant moves.
+    ///
+    /// Ignored by every algorithm but [`Algorithm::Regicide`].
+    #[cfg(feature = "regicide")]
+    pub move_elimination_level: ::regicide::MoveEliminationLevel,
 }
 
 pub(crate) trait VecExt<T> {
