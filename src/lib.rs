@@ -1692,13 +1692,24 @@ pub enum RegAllocError {
     /// `regicide::Error` cannot be reconstructed from its serialized form.
     #[cfg(feature = "regicide")]
     Regicide(alloc::string::String),
+    /// The regicide shim cannot express some part of this function, or of the
+    /// machine environment it is to be allocated against, in regicide's
+    /// interface.
+    ///
+    /// A property of the input rather than a bug: this crate's interface admits
+    /// things regicide's does not, such as a block that is unreachable from the
+    /// entry block or an operand pinned to a register the allocator does not
+    /// own.
+    #[cfg(feature = "regicide")]
+    RegicideUnsupported(alloc::string::String),
     /// The regicide shim could not express regicide's answer in this crate's
     /// interface.
     ///
-    /// Always a bug rather than a property of the input: the shim relies on
-    /// this crate's CFG validation to rule out everything regicide can emit
-    /// that [`Edit`] cannot represent, so reaching this means that reasoning
-    /// is wrong.
+    /// Always a bug rather than a property of the input: the shim only ever
+    /// hands regicide constructs whose answers it can translate back, and
+    /// relies on this crate's CFG validation to rule out everything regicide
+    /// can emit that [`Edit`] cannot represent. Reaching this means some part
+    /// of that reasoning is wrong.
     #[cfg(feature = "regicide")]
     RegicideShim(alloc::string::String),
 }
