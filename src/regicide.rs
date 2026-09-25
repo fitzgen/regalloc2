@@ -417,13 +417,6 @@ struct Prepass {
     /// Which operands of the instruction in hand are already the target of a
     /// reuse, since no two reuses may name the same one.
     reuse_targets: Vec<u32>,
-
-    /// How many times each vreg is used, indexed like `vreg_to_val`.
-    ///
-    /// Branch arguments count, and `fixed_nonallocatable` operands do not.
-    /// This is only ever compared against the number of uses at one
-    /// instruction, to answer "might this value outlive that instruction?".
-    uses: Vec<u32>,
 }
 
 /// Note the definition of `vreg`, giving it the next `Val`.
@@ -664,10 +657,8 @@ fn build_prepass<F: Function>(
         operands,
         insts,
         reuse_targets,
-        uses,
     } = prepass;
     let vreg_to_val = vreg_to_val.repopulate(func.num_vregs(), u32::MAX);
-    let uses = uses.repopulate(func.num_vregs(), 0);
     let val_class = val_class.cleared();
     let operands = operands.cleared();
     let insts = insts.repopulate(
@@ -724,19 +715,6 @@ fn build_prepass<F: Function>(
                         op.vreg(),
                         inst,
                     )?;
-                } else if let Some(count) = uses.get_mut(op.vreg().vreg()) {
-                    *count += 1;
-                }
-            }
-        }
-
-        // A block argument is a use too, and one nothing below would see,
-        // since it is not an operand.
-        let last = range.last();
-        for (i, _) in func.block_succs(block).iter().enumerate() {
-            for &vreg in func.branch_blockparams(block, last, i) {
-                if let Some(count) = uses.get_mut(vreg.vreg()) {
-                    *count += 1;
                 }
             }
         }
@@ -758,70 +736,7 @@ fn build_prepass<F: Function>(
         }
         resolve_reuses(val_class, &mut operands[ops_start..], reuse_targets)?;
 
-        // regicide cannot pin a value that outlives an instruction to a
-        // register that the instruction hands to something else at its late
-        // point — a clobber, or a fixed definition.
-        //
-        // regalloc2 allows exactly this: `Function::inst_clobbers` says only a
-        // def or a *late* use may not collide with a clobber, so a clobber of
-        // the register an early use names is legal, and it is the shape a call
-        // takes whose argument is still live afterwards. ion satisfies it by
-        // copying the value into the pinned register and leaving the original
-        // where it was, a copy that is dead as soon as the instruction runs.
-        //
-        // regicide has no such copy. It *tiles* a value's live range into
-        // consecutive pieces joined by moves, and its smallest piece covers a
-        // whole instruction, because a move can only be inserted between two
-        // instructions and never inside one
-        // (`regicide/src/live_ranges.rs:405-408`). So the piece pinned to the
-        // register has to hold it until the gap *after* the instruction, by
-        // which time the late writer has destroyed it, and regicide reports
-        // `Error::TooManyLiveRegs`. Say so plainly here instead.
         let clobbers = func.inst_clobbers(inst);
-        for &op in ops {
-            if op.kind() != OperandKind::Use
-                || op.pos() != OperandPos::Early
-                || op.as_fixed_nonallocatable().is_some()
-            {
-                continue;
-            }
-            let preg = match op.constraint() {
-                OperandConstraint::FixedReg(preg) => preg,
-                _ => continue,
-            };
-            let taken_late = clobbers.contains(preg)
-                || ops.iter().any(|other| {
-                    other.pos() == OperandPos::Late
-                        && other.vreg() != op.vreg()
-                        && other.constraint() == OperandConstraint::FixedReg(preg)
-                });
-            if !taken_late {
-                continue;
-            }
-
-            // Whether the value outlives the instruction, conservatively: a
-            // use anywhere else keeps it alive here as far as this test is
-            // concerned, since a use earlier in the instruction order may
-            // still come later around a back edge.
-            let here = ops
-                .iter()
-                .filter(|other| {
-                    other.kind() == OperandKind::Use
-                        && other.vreg() == op.vreg()
-                        && other.as_fixed_nonallocatable().is_none()
-                })
-                .count();
-            if usize::try_from(uses[op.vreg().vreg()]).unwrap_or(usize::MAX) > here {
-                return Err(RegAllocError::RegicideUnsupported(format!(
-                    "an instruction pins {:?}, which outlives it, to {:?}, \
-                     which the same instruction clobbers or redefines; \
-                     regicide cannot keep a value in a register only for the \
-                     first half of an instruction",
-                    op.vreg(),
-                    preg,
-                )));
-            }
-        }
 
         // A clobbered register holds something undefined after the
         // instruction, which is exactly a dead definition pinned to it.
@@ -1575,4 +1490,286 @@ pub(crate) fn run<F: Function>(
         output,
         spillslot_map,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the shim paths that fuzzing cannot reach.
+    //!
+    //! `fuzzing::func` only ever generates `Any`, `Reg`, `FixedReg` and
+    //! `Reuse` constraints, and its `machine_env` names no scratch register,
+    //! so `OperandConstraint::Stack`, `OperandConstraint::Limit` and the
+    //! class-less scratch register have no other coverage.
+
+    use super::*;
+    use crate::checker::Checker;
+    use crate::{Algorithm, InstRange, Output};
+    use alloc::vec;
+
+    /// A single straight-line block ending in a return.
+    struct Probe {
+        insts: Vec<Vec<Operand>>,
+        num_vregs: usize,
+    }
+
+    impl Probe {
+        fn new(insts: Vec<Vec<Operand>>) -> Self {
+            let num_vregs = insts
+                .iter()
+                .flatten()
+                .map(|op| op.vreg().vreg() + 1)
+                .max()
+                .unwrap_or(0);
+            Probe { insts, num_vregs }
+        }
+    }
+
+    impl Function for Probe {
+        fn num_insts(&self) -> usize {
+            self.insts.len()
+        }
+        fn num_blocks(&self) -> usize {
+            1
+        }
+        fn entry_block(&self) -> Block {
+            Block::new(0)
+        }
+        fn block_insns(&self, _: Block) -> InstRange {
+            InstRange::new(Inst::new(0), Inst::new(self.insts.len()))
+        }
+        fn block_succs(&self, _: Block) -> &[Block] {
+            &[]
+        }
+        fn block_preds(&self, _: Block) -> &[Block] {
+            &[]
+        }
+        fn block_params(&self, _: Block) -> &[VReg] {
+            &[]
+        }
+        fn is_ret(&self, insn: Inst) -> bool {
+            insn.index() == self.insts.len() - 1
+        }
+        fn is_branch(&self, _: Inst) -> bool {
+            false
+        }
+        fn branch_blockparams(&self, _: Block, _: Inst, _: usize) -> &[VReg] {
+            &[]
+        }
+        fn inst_operands(&self, insn: Inst) -> &[Operand] {
+            &self.insts[insn.index()]
+        }
+        fn inst_clobbers(&self, _: Inst) -> PRegSet {
+            PRegSet::empty()
+        }
+        fn num_vregs(&self) -> usize {
+            self.num_vregs
+        }
+        fn spillslot_size(&self, _: RegClass) -> usize {
+            1
+        }
+    }
+
+    /// The environment `fuzzing::func` uses, but with `hw_enc` 32 of each
+    /// class held back so a caller can make it a scratch register.
+    fn env_with_scratch(scratch: [Option<PReg>; NUM_CLASSES]) -> MachineEnv {
+        fn regs(r: Range<usize>, c: RegClass) -> PRegSet {
+            r.map(|i| PReg::new(i, c)).collect()
+        }
+        MachineEnv {
+            preferred_regs_by_class: [
+                regs(0..24, RegClass::Int),
+                regs(0..24, RegClass::Float),
+                regs(0..24, RegClass::Vector),
+            ],
+            non_preferred_regs_by_class: [
+                regs(24..32, RegClass::Int),
+                regs(24..32, RegClass::Float),
+                regs(24..32, RegClass::Vector),
+            ],
+            scratch_by_class: scratch,
+            fixed_stack_slots: vec![],
+        }
+    }
+
+    /// Allocate with regicide and run this crate's checker over the result.
+    fn alloc(func: &Probe, env: &MachineEnv) -> Output {
+        let options = RegallocOptions {
+            algorithm: Algorithm::Regicide,
+            validate_ssa: true,
+            ..RegallocOptions::default()
+        };
+        let output = crate::run(func, env, &options).expect("regicide should allocate this");
+        let mut checker = Checker::new(func, env);
+        checker.prepare(&output);
+        checker.run().expect("checker should accept this");
+        output
+    }
+
+    #[test]
+    fn stack_constraint() {
+        let v0 = VReg::new(0, RegClass::Int);
+        let func = Probe::new(vec![
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Reg,
+                OperandKind::Def,
+                OperandPos::Late,
+            )],
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Stack,
+                OperandKind::Use,
+                OperandPos::Early,
+            )],
+            vec![],
+        ]);
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let output = alloc(&func, &env);
+
+        let use_alloc = output.inst_allocs(Inst::new(1))[0];
+        assert!(
+            use_alloc.is_stack(),
+            "a `Stack` operand must land on the stack, got {:?}",
+            use_alloc,
+        );
+    }
+
+    #[test]
+    fn limit_constraint() {
+        // Half the preferred registers: a real class, and not the base class,
+        // so `MachineCache::limit_class` has to have built one for it.
+        const LIMIT: usize = 16;
+
+        let v0 = VReg::new(0, RegClass::Int);
+        let func = Probe::new(vec![
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Limit(LIMIT),
+                OperandKind::Def,
+                OperandPos::Late,
+            )],
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Limit(LIMIT),
+                OperandKind::Use,
+                OperandPos::Early,
+            )],
+            vec![],
+        ]);
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let output = alloc(&func, &env);
+
+        for inst in [0, 1] {
+            let alloc = output.inst_allocs(Inst::new(inst))[0];
+            let preg = alloc
+                .as_reg()
+                .expect("a `Limit` operand must get a register");
+            assert!(
+                preg.hw_enc() < LIMIT,
+                "a `Limit({})` operand must get a register below {}, got {:?}",
+                LIMIT,
+                LIMIT,
+                preg,
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_stack_slot_is_refused_not_miscompiled() {
+        // `fuzzing::regicide` caps fixed registers at the allocatable range,
+        // so nothing else now exercises this rejection. regicide defines a
+        // non-allocatable register without units and so cannot hold a value
+        // in one; the shim must say so rather than allocate something wrong.
+        let v0 = VReg::new(0, RegClass::Int);
+        let slot = PReg::new(40, RegClass::Int);
+        let func = Probe::new(vec![
+            vec![Operand::new(
+                v0,
+                OperandConstraint::FixedReg(slot),
+                OperandKind::Def,
+                OperandPos::Late,
+            )],
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Reg,
+                OperandKind::Use,
+                OperandPos::Early,
+            )],
+            vec![],
+        ]);
+        let mut env = env_with_scratch([None; NUM_CLASSES]);
+        env.fixed_stack_slots = vec![slot];
+
+        let options = RegallocOptions {
+            algorithm: Algorithm::Regicide,
+            validate_ssa: true,
+            ..RegallocOptions::default()
+        };
+        match crate::run(&func, &env, &options) {
+            Err(RegAllocError::RegicideUnsupported(_)) => {}
+            other => panic!(
+                "a value pinned to a fixed stack slot must be refused, got {:?}",
+                other.map(|o| o.num_spillslots),
+            ),
+        }
+    }
+
+    #[test]
+    fn scratch_register_holds_nothing() {
+        // More values live at once than there are registers, so the allocator
+        // has to spill and reload; the scratch register is the only one left
+        // to stage a stack-to-stack move through, and it must still never be
+        // where a value lives.
+        const NUM_REGS: usize = 32;
+        const NUM_VALS: usize = NUM_REGS + 8;
+        let scratch = PReg::new(NUM_REGS, RegClass::Int);
+        let env = env_with_scratch([Some(scratch), None, None]);
+
+        let vregs: Vec<VReg> = (0..NUM_VALS).map(|i| VReg::new(i, RegClass::Int)).collect();
+
+        // Define every value, then read each one back in its own instruction,
+        // so they are all live across the whole body but no single
+        // instruction asks for more registers than exist.
+        let mut insts: Vec<Vec<Operand>> = vregs
+            .iter()
+            .map(|&v| {
+                vec![Operand::new(
+                    v,
+                    OperandConstraint::Reg,
+                    OperandKind::Def,
+                    OperandPos::Late,
+                )]
+            })
+            .collect();
+        insts.extend(vregs.iter().rev().map(|&v| {
+            vec![Operand::new(
+                v,
+                OperandConstraint::Reg,
+                OperandKind::Use,
+                OperandPos::Early,
+            )]
+        }));
+        insts.push(vec![]);
+
+        let func = Probe::new(insts);
+        let output = alloc(&func, &env);
+
+        // Otherwise the test proves nothing: without a spill there is nothing
+        // for a scratch register to stage.
+        assert!(
+            output.num_spillslots > 0,
+            "this shape was supposed to outrun the register file",
+        );
+
+        for inst in 0..func.num_insts() {
+            for alloc in output.inst_allocs(Inst::new(inst)) {
+                assert_ne!(
+                    alloc.as_reg(),
+                    Some(scratch),
+                    "the scratch register must never hold a value, but inst{} puts one there",
+                    inst,
+                );
+            }
+        }
+    }
 }

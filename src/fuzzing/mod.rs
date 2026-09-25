@@ -8,3 +8,5 @@ pub mod fastalloc;
 pub mod func;
 pub mod ion;
 pub mod moves;
+#[cfg(feature = "regicide")]
+pub mod regicide;

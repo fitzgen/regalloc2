@@ -24,6 +24,8 @@ struct Args {
 enum CliAlgorithm {
     Ion,
     Fastalloc,
+    #[cfg(feature = "regicide")]
+    Regicide,
 }
 
 impl From<CliAlgorithm> for Algorithm {
@@ -31,6 +33,8 @@ impl From<CliAlgorithm> for Algorithm {
         match cli_algo {
             CliAlgorithm::Ion => Algorithm::Ion,
             CliAlgorithm::Fastalloc => Algorithm::Fastalloc,
+            #[cfg(feature = "regicide")]
+            CliAlgorithm::Regicide => Algorithm::Regicide,
         }
     }
 }
@@ -51,6 +55,7 @@ fn main() {
         verbose_log: true,
         validate_ssa: true,
         algorithm: args.algorithm.into(),
+        ..RegallocOptions::default()
     };
     let output = match regalloc2::run(&function, function.machine_env(), &options) {
         Ok(output) => output,

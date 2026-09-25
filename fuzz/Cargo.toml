@@ -43,6 +43,12 @@ path = "fuzz_targets/moves.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "regicide"
+path = "fuzz_targets/regicide.rs"
+test = false
+doc = false
+
 # Enable debug assertions and overflow checks when fuzzing
 [profile.release]
 debug = true

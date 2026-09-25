@@ -11,6 +11,9 @@ license = "Apache-2.0 WITH LLVM-exception"
 description = "Tool for testing regalloc2"
 repository = "https://github.com/bytecodealliance/regalloc2"
 
+[features]
+regicide = ["regalloc2/regicide"]
+
 [dependencies]
 bincode = "1.3.3"
 clap = { version = "4.3.11", features = ["derive"] }

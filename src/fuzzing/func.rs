@@ -315,8 +315,9 @@ fn convert_op_to_fixed(
     op: &mut Operand,
     fixed_early: &mut Vec<PReg>,
     fixed_late: &mut Vec<PReg>,
+    fixed_reg_max: usize,
 ) -> ArbitraryResult<()> {
-    let fixed_reg = PReg::new(u.int_in_range(0..=62)?, op.class());
+    let fixed_reg = PReg::new(u.int_in_range(0..=fixed_reg_max)?, op.class());
 
     if op.kind() == OperandKind::Def && op.pos() == OperandPos::Early {
         // Early-defs with fixed constraints conflict with
@@ -374,6 +375,14 @@ pub struct Options {
     pub num_uses_per_inst: RangeInclusive<usize>,
     pub num_callsite_ish_vregs_per_inst: RangeInclusive<usize>,
     pub num_clobbers_per_inst: RangeInclusive<usize>,
+    /// The largest hardware encoding a `FixedReg` constraint may name.
+    ///
+    /// The default covers registers that [`machine_env`] hands to
+    /// `fixed_stack_slots` as well as the ones it makes allocatable, because a
+    /// `FixedReg` onto a fixed stack slot is how a stack argument is spelled.
+    /// Lower it to the allocatable range for a backend that cannot hold a
+    /// value anywhere but a register.
+    pub fixed_reg_max: usize,
 }
 
 impl Options {
@@ -390,6 +399,7 @@ impl Options {
         num_uses_per_inst: 0..=10,
         num_callsite_ish_vregs_per_inst: 0..=20,
         num_clobbers_per_inst: 0..=10,
+        fixed_reg_max: 62,
     };
 }
 
@@ -542,7 +552,13 @@ impl Func {
                         // Pick an operand and make it a fixed reg.
                         let i = u.int_in_range(0..=(operands.len() - 1))?;
                         let op = &mut operands[i];
-                        convert_op_to_fixed(u, op, &mut fixed_early, &mut fixed_late)?;
+                        convert_op_to_fixed(
+                            u,
+                            op,
+                            &mut fixed_early,
+                            &mut fixed_late,
+                            opts.fixed_reg_max,
+                        )?;
                     }
 
                     if opts.callsite_ish_constraints && bool::arbitrary(u)? {

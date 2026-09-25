@@ -67,6 +67,11 @@ pub mod fuzzing;
 #[cfg(feature = "regicide")]
 pub(crate) mod regicide;
 
+/// Re-exported so that [`RegallocOptions::move_elimination_level`] can be set
+/// without depending on `regicide` directly.
+#[cfg(feature = "regicide")]
+pub use ::regicide::MoveEliminationLevel;
+
 #[cfg(feature = "enable-serde")]
 pub mod serialize;
 
