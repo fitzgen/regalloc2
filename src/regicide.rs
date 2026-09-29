@@ -81,6 +81,38 @@ fn class_of_index(index: usize) -> RegClass {
     }
 }
 
+/// Every register the allocator may hand out for the class with the given
+/// index, most preferred first, written into `out`.
+fn granted_regs(env: &MachineEnv, index: usize, out: &mut Vec<PReg>) {
+    let class = class_of_index(index);
+    out.clear();
+    let mut seen = PRegSet::empty();
+    for set in [
+        &env.preferred_regs_by_class[index],
+        &env.non_preferred_regs_by_class[index],
+    ] {
+        for preg in set {
+            if preg.class() == class && !seen.contains(preg) {
+                seen.add(preg);
+                out.push(preg);
+            }
+        }
+    }
+}
+
+/// Does the environment grant the allocator any register of the class with the
+/// given index, i.e. does the class get a bank?
+fn grants_any(env: &MachineEnv, index: usize) -> bool {
+    let class = class_of_index(index);
+    [
+        &env.preferred_regs_by_class[index],
+        &env.non_preferred_regs_by_class[index],
+    ]
+    .iter()
+    .flat_map(|set| set.into_iter())
+    .any(|preg| preg.class() == class)
+}
+
 /// The scratch space a run of regicide needs, kept across runs.
 ///
 /// This hangs off [`Ctx`][crate::Ctx] and is reused rather than rebuilt,
@@ -112,7 +144,14 @@ struct MachineKey {
     preferred: [PRegSet; NUM_CLASSES],
     non_preferred: [PRegSet; NUM_CLASSES],
     scratch: [Option<PReg>; NUM_CLASSES],
-    spillslot_size: [usize; NUM_CLASSES],
+
+    /// The spill-slot size of each class the environment grants a register
+    /// for, and `None` for a class it does not.
+    ///
+    /// A class with no bank has no answer to give: aarch64, x64 and s390x all
+    /// hit an `unreachable!()` when asked about `RegClass::Vector`. So only
+    /// ask for a class whose answer gets used.
+    spillslot_size: [Option<usize>; NUM_CLASSES],
 }
 
 impl MachineKey {
@@ -121,7 +160,9 @@ impl MachineKey {
             preferred: env.preferred_regs_by_class,
             non_preferred: env.non_preferred_regs_by_class,
             scratch: env.scratch_by_class,
-            spillslot_size: core::array::from_fn(|i| func.spillslot_size(class_of_index(i))),
+            spillslot_size: core::array::from_fn(|i| {
+                grants_any(env, i).then(|| func.spillslot_size(class_of_index(i)))
+            }),
         }
     }
 }
@@ -142,6 +183,10 @@ struct MachineCache {
     /// The singleton class naming each `PReg` an operand may be pinned to, or
     /// `None` for one nothing may name — which is to say, a scratch register.
     class_of_preg: [Option<rgc::RegClass>; PReg::NUM_INDEX],
+
+    /// The inverse of `preg_of_reg`: the regicide register naming each `PReg`
+    /// the allocator may hand out, and `None` for one it may not.
+    reg_of_preg: [Option<rgc::Reg>; PReg::NUM_INDEX],
 
     /// The `PReg` behind each regicide register, indexed by its `Reg` index.
     ///
@@ -194,11 +239,12 @@ fn define_unit_reg(
 }
 
 impl MachineCache {
-    fn build(key: MachineKey, _env: &MachineEnv) -> Result<Self, RegAllocError> {
+    fn build(key: MachineKey, env: &MachineEnv) -> Result<Self, RegAllocError> {
         let mut builder = rgc::MachineBuilder::new();
 
         let mut allocatable = PRegSet::empty();
         let mut class_of_preg = [None; PReg::NUM_INDEX];
+        let mut reg_of_preg = [None; PReg::NUM_INDEX];
         let mut preg_of_reg = Vec::new();
         let mut base_class = [None; NUM_CLASSES];
         let mut limit_class = [[None; LIMIT_LEVELS]; NUM_CLASSES];
@@ -212,27 +258,19 @@ impl MachineCache {
             let class = class_of_index(c);
 
             // The registers the allocator may hand out, most preferred first.
-            granted.clear();
-            let mut seen = PRegSet::empty();
-            for set in [&key.preferred[c], &key.non_preferred[c]] {
-                for preg in set {
-                    if preg.class() == class && !seen.contains(preg) {
-                        seen.add(preg);
-                        granted.push(preg);
-                    }
-                }
-            }
+            granted_regs(env, c, &mut granted);
 
             // Two spill slots can need a move between them, and no machine can
             // do that without a register to stage it in, so regicide refuses a
             // bank it owns nothing in. A class the environment grants nothing
             // for therefore has no bank at all, and anything naming it is
-            // unsupported.
+            // unsupported. `MachineKey::new` asked for the spill-slot size
+            // under this same condition, so the size is there when wanted.
             if granted.is_empty() {
                 continue;
             }
 
-            let size = key.spillslot_size[c];
+            let size = key.spillslot_size[c].expect("a granted class was asked its slot size");
             let size = u16::try_from(size)
                 .ok()
                 .and_then(rgc::SpillSlotSize::new)
@@ -251,6 +289,7 @@ impl MachineCache {
             for &preg in &granted {
                 let reg = define_unit_reg(&mut builder, bank, preg)?;
                 preg_of_reg.push(preg);
+                reg_of_preg[preg.index()] = Some(reg);
                 regs.push(reg);
                 allocatable.add(preg);
             }
@@ -267,8 +306,9 @@ impl MachineCache {
                         class,
                     )));
                 }
-                define_unit_reg(&mut builder, bank, scratch)?;
+                let reg = define_unit_reg(&mut builder, bank, scratch)?;
                 preg_of_reg.push(scratch);
+                reg_of_preg[scratch.index()] = Some(reg);
                 allocatable.add(scratch);
             }
 
@@ -347,6 +387,7 @@ impl MachineCache {
             machine: builder.finish().map_err(machine_error)?,
             allocatable,
             class_of_preg,
+            reg_of_preg,
             preg_of_reg,
             base_class,
             limit_class,
@@ -381,13 +422,8 @@ struct InstInfo {
     /// Where this instruction's operands start in [`Prepass::operands`].
     ops_start: u32,
 
-    /// How many of them came from
-    /// [`inst_operands`][crate::Function::inst_operands], as opposed to being
-    /// clobbers this shim appended.
-    num_real: u32,
-
-    /// How many there are in total.
-    num_total: u32,
+    /// How many of them there are.
+    num_operands: u32,
 
     /// The block this instruction lies in.
     block: Block,
@@ -405,11 +441,16 @@ struct Prepass {
 
     /// The class each `Val` naturally lives in, indexed by `Val`.
     ///
-    /// Its length is the function's value count, clobber values included.
+    /// Its length is the function's value count.
     val_class: Vec<rgc::RegClass>,
 
     /// Every instruction's operands, back to back.
     operands: Vec<rgc::Operand>,
+
+    /// The registers each instruction clobbers, indexed by `Inst`. Held here
+    /// because `AdaptorInst` is deliberately not generic over the `Function`,
+    /// so it has nothing to ask.
+    clobbers: Vec<rgc::RegSet>,
 
     /// Per-instruction bookkeeping, indexed by `Inst`.
     insts: Vec<InstInfo>,
@@ -655,18 +696,19 @@ fn build_prepass<F: Function>(
         vreg_to_val,
         val_class,
         operands,
+        clobbers,
         insts,
         reuse_targets,
     } = prepass;
     let vreg_to_val = vreg_to_val.repopulate(func.num_vregs(), u32::MAX);
     let val_class = val_class.cleared();
     let operands = operands.cleared();
+    let clobbers = clobbers.cleared();
     let insts = insts.repopulate(
         num_insts,
         InstInfo {
             ops_start: 0,
-            num_real: 0,
-            num_total: 0,
+            num_operands: 0,
             block: Block::invalid(),
         },
     );
@@ -725,7 +767,7 @@ fn build_prepass<F: Function>(
         )));
     }
 
-    // Second walk: translate every operand, and append one for each clobber.
+    // Second walk: translate every operand, and gather every clobber.
     for i in 0..num_insts {
         let inst = Inst::new(i);
         let ops = func.inst_operands(inst);
@@ -736,37 +778,37 @@ fn build_prepass<F: Function>(
         }
         resolve_reuses(val_class, &mut operands[ops_start..], reuse_targets)?;
 
-        let clobbers = func.inst_clobbers(inst);
-
-        // A clobbered register holds something undefined after the
-        // instruction, which is exactly a dead definition pinned to it.
-        for preg in clobbers {
-            if !machine.allocatable.contains(preg) {
-                return Err(RegAllocError::RegicideUnsupported(format!(
-                    "an instruction clobbers {:?}, which is not a register the \
-                     allocator owns",
-                    preg,
-                )));
-            }
-            let class = machine.singleton(preg)?;
-            let val = rgc::Val::try_new(val_class.len()).expect("a Val index fits in a Val");
-            val_class.push(class);
-            operands.push(rgc::Operand::new(
-                rgc::Position::Late,
-                rgc::DefUse::Def,
-                rgc::OperandConstraint::Reg(class),
-                Some(val),
-            ));
-        }
-
-        if operands.len() - ops_start > rgc::MAX_OPERANDS_PER_INST {
+        if ops.len() > rgc::MAX_OPERANDS_PER_INST {
             return Err(RegAllocError::TooManyOperands);
         }
 
+        // regicide's clobber set means the same thing, so this is a straight
+        // translation.
+        let mut clobbered = rgc::RegSet::new();
+        for preg in func.inst_clobbers(inst) {
+            // A register the allocator does not own holds nothing to
+            // destroy, so the clobber says nothing. regicide skips these
+            // itself; dropping them here just keeps the set small.
+            if !machine.allocatable.contains(preg) {
+                continue;
+            }
+
+            // A `scratch_by_class` register is allocatable here, precisely
+            // so moves can be staged through it, so clobbering it is a real
+            // conflict. `singleton` has no class for it and says so; the
+            // class is not wanted, and this call is for that refusal alone.
+            let _ = machine.singleton(preg)?;
+
+            clobbered.insert(
+                machine.reg_of_preg[preg.index()].expect(
+                    "every allocatable `PReg` was given a `Reg` when the machine was built",
+                ),
+            );
+        }
+        clobbers.push(clobbered);
+
         insts[i].ops_start = u32::try_from(ops_start).expect("an operand index fits in a u32");
-        insts[i].num_real = u32::try_from(ops.len()).expect("an operand index fits in a u32");
-        insts[i].num_total =
-            u32::try_from(operands.len() - ops_start).expect("an operand index fits in a u32");
+        insts[i].num_operands = u32::try_from(ops.len()).expect("an operand index fits in a u32");
     }
 
     // Finally, the edges. A block argument is not an operand, so nothing above
@@ -835,7 +877,7 @@ impl<'a> AdaptorInst<'a> {
     fn ops(&self) -> &'a [rgc::Operand] {
         let info = self.prepass.insts[self.inst];
         let start = info.ops_start as usize;
-        &self.prepass.operands[start..start + info.num_total as usize]
+        &self.prepass.operands[start..start + info.num_operands as usize]
     }
 }
 
@@ -1082,7 +1124,7 @@ impl<'a> rgc::InputInst<'a> for AdaptorInst<'a> {
     }
 
     fn operands_len(&self) -> usize {
-        self.prepass.insts[self.inst].num_total as usize
+        self.prepass.insts[self.inst].num_operands as usize
     }
 
     type OperandsIter<'b>
@@ -1096,6 +1138,11 @@ impl<'a> rgc::InputInst<'a> for AdaptorInst<'a> {
 
     fn operand(&self, i: usize) -> rgc::Operand {
         self.ops()[i]
+    }
+
+    fn clobbers(&self) -> rgc::RegSet {
+        // A 64-byte copy; `RegSet` is a plain bit array.
+        self.prepass.clobbers[self.inst].clone()
     }
 
     fn block(&self) -> rgc::Block {
@@ -1301,7 +1348,6 @@ fn translate_edit(
 fn translate_output<F: Function>(
     func: &F,
     machine: &MachineCache,
-    prepass: &Prepass,
     adaptor: &Adaptor<'_, F>,
     result: &rgc::Output<'_>,
     output: &mut crate::Output,
@@ -1348,15 +1394,12 @@ fn translate_output<F: Function>(
     }
     output.num_spillslots = offset as usize;
 
-    // The allocations, one run per instruction. The clobbers this shim appended
-    // are its own business, so only the operands the function really has are
-    // reported back.
+    // The allocations, one run per instruction.
     for i in 0..num_insts {
-        let num_real = prepass.insts[i].num_real as usize;
         output
             .inst_alloc_offsets
             .push(u32::try_from(output.allocs.len()).expect("an alloc index fits in a u32"));
-        for &alloc in &result.inst_allocs(rgc_inst(i))[..num_real] {
+        for &alloc in result.inst_allocs(rgc_inst(i)) {
             let alloc = translate_alloc(machine, spillslot_map, alloc)?;
             output.allocs.push(alloc);
         }
@@ -1481,15 +1524,7 @@ pub(crate) fn run<F: Function>(
     context.reset();
     let result = rgc::run(context, &input).map_err(map_run_error)?;
 
-    translate_output(
-        func,
-        machine,
-        prepass,
-        &adaptor,
-        &result,
-        output,
-        spillslot_map,
-    )
+    translate_output(func, machine, &adaptor, &result, output, spillslot_map)
 }
 
 #[cfg(test)]
@@ -1510,6 +1545,13 @@ mod tests {
     struct Probe {
         insts: Vec<Vec<Operand>>,
         num_vregs: usize,
+        /// The registers this function's instructions clobber.
+        clobbers: PRegSet,
+        /// Which instruction clobbers them, or `None` for all of them.
+        clobbers_at: Option<usize>,
+        /// Each class's spill-slot size; `None` for a class that panics when
+        /// asked.
+        spillslot_size: [Option<usize>; NUM_CLASSES],
     }
 
     impl Probe {
@@ -1520,7 +1562,33 @@ mod tests {
                 .map(|op| op.vreg().vreg() + 1)
                 .max()
                 .unwrap_or(0);
-            Probe { insts, num_vregs }
+            Probe {
+                insts,
+                num_vregs,
+                clobbers: PRegSet::empty(),
+                clobbers_at: None,
+                spillslot_size: [Some(1); NUM_CLASSES],
+            }
+        }
+
+        /// Make every instruction clobber `preg`.
+        fn clobbering(mut self, preg: PReg) -> Self {
+            self.clobbers.add(preg);
+            self
+        }
+
+        /// Make only instruction `inst` clobber, and have it clobber `pregs`.
+        fn clobbering_only_at(mut self, inst: usize, pregs: PRegSet) -> Self {
+            self.clobbers = pregs;
+            self.clobbers_at = Some(inst);
+            self
+        }
+
+        /// Make `class` panic when asked its spill-slot size, as Cranelift's
+        /// backends do for a class they grant no register for.
+        fn with_unanswerable_spillslot_size(mut self, class: RegClass) -> Self {
+            self.spillslot_size[class as usize] = None;
+            self
         }
     }
 
@@ -1558,14 +1626,19 @@ mod tests {
         fn inst_operands(&self, insn: Inst) -> &[Operand] {
             &self.insts[insn.index()]
         }
-        fn inst_clobbers(&self, _: Inst) -> PRegSet {
-            PRegSet::empty()
+        fn inst_clobbers(&self, insn: Inst) -> PRegSet {
+            match self.clobbers_at {
+                Some(i) if i != insn.index() => PRegSet::empty(),
+                _ => self.clobbers,
+            }
         }
         fn num_vregs(&self) -> usize {
             self.num_vregs
         }
-        fn spillslot_size(&self, _: RegClass) -> usize {
-            1
+        fn spillslot_size(&self, class: RegClass) -> usize {
+            self.spillslot_size[class as usize].unwrap_or_else(|| {
+                panic!("this target has no spill-slot size for {:?} to give", class)
+            })
         }
     }
 
@@ -1709,6 +1782,134 @@ mod tests {
             Err(RegAllocError::RegicideUnsupported(_)) => {}
             other => panic!(
                 "a value pinned to a fixed stack slot must be refused, got {:?}",
+                other.map(|o| o.num_spillslots),
+            ),
+        }
+    }
+
+    /// A one-instruction function that returns, and does nothing else.
+    fn trivial() -> Probe {
+        Probe::new(vec![vec![]])
+    }
+
+    #[test]
+    fn an_ungranted_class_is_never_asked_its_spillslot_size() {
+        // aarch64, x64 and s390x all answer `spillslot_size(RegClass::Vector)`
+        // with `unreachable!()`, so the shim must not ask.
+        let func = trivial().with_unanswerable_spillslot_size(RegClass::Vector);
+
+        let mut env = env_with_scratch([None; NUM_CLASSES]);
+        env.preferred_regs_by_class[RegClass::Vector as usize] = PRegSet::empty();
+        env.non_preferred_regs_by_class[RegClass::Vector as usize] = PRegSet::empty();
+
+        // The panic, if the shim asks, is the failure.
+        alloc(&func, &env);
+    }
+
+    #[test]
+    fn a_clobber_of_a_register_the_allocator_does_not_own_is_a_no_op() {
+        // aarch64 withholds `x16`/`x17` yet lists them among every call's
+        // clobbers, so every call would otherwise be unallocatable.
+        let v0 = VReg::new(0, RegClass::Int);
+        let env = env_with_scratch([None; NUM_CLASSES]);
+
+        let unowned = PReg::new(40, RegClass::Int);
+        assert!(
+            !env.preferred_regs_by_class[RegClass::Int as usize].contains(unowned)
+                && !env.non_preferred_regs_by_class[RegClass::Int as usize].contains(unowned),
+            "the test only means something if the environment withholds this register",
+        );
+
+        let func = Probe::new(vec![
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Reg,
+                OperandKind::Def,
+                OperandPos::Late,
+            )],
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Reg,
+                OperandKind::Use,
+                OperandPos::Early,
+            )],
+            vec![],
+        ])
+        .clobbering(unowned);
+
+        let output = alloc(&func, &env);
+
+        // Nothing may be placed in the register on its account either.
+        for inst in 0..func.num_insts() {
+            for alloc in output.inst_allocs(Inst::new(inst)) {
+                assert_ne!(alloc.as_reg(), Some(unowned));
+            }
+        }
+    }
+
+    #[test]
+    fn an_instruction_clobbering_every_register_still_allocates() {
+        // A call on aarch64 clobbers every Int register the allocator owns.
+        // Each reserves only a late half, which an early read does not want.
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let granted: PRegSet = env.preferred_regs_by_class[RegClass::Int as usize]
+            .into_iter()
+            .chain(env.non_preferred_regs_by_class[RegClass::Int as usize])
+            .collect();
+        assert_eq!(
+            granted.into_iter().count(),
+            32,
+            "the test only means something if the environment grants registers",
+        );
+
+        let v0 = VReg::new(0, RegClass::Int);
+        let func = Probe::new(vec![
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Reg,
+                OperandKind::Def,
+                OperandPos::Late,
+            )],
+            // The clobbering instruction, reading the value in the early
+            // half the clobbers leave alone. The value dies here.
+            vec![Operand::new(
+                v0,
+                OperandConstraint::Reg,
+                OperandKind::Use,
+                OperandPos::Early,
+            )],
+            vec![],
+        ])
+        .clobbering_only_at(1, granted);
+
+        let output = alloc(&func, &env);
+
+        let read = output.inst_allocs(Inst::new(1))[0];
+        assert!(
+            read.as_reg().is_some_and(|preg| granted.contains(preg)),
+            "the early read must get one of the clobbered registers, got {:?}",
+            read,
+        );
+    }
+
+    #[test]
+    fn a_clobber_of_the_scratch_register_is_refused_not_ignored() {
+        // The other side of the previous test: the scratch register is
+        // allocatable, so clobbering it is a real conflict, and the shim must
+        // say so rather than drop the clobber.
+        let scratch = PReg::new(32, RegClass::Int);
+        let func = trivial().clobbering(scratch);
+        let env = env_with_scratch([Some(scratch), None, None]);
+
+        let options = RegallocOptions {
+            algorithm: Algorithm::Regicide,
+            validate_ssa: true,
+            ..RegallocOptions::default()
+        };
+        match crate::run(&func, &env, &options) {
+            Err(RegAllocError::RegicideUnsupported(_)) => {}
+            other => panic!(
+                "a clobber of the scratch register must be refused, got {:?}",
                 other.map(|o| o.num_spillslots),
             ),
         }
