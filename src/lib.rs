@@ -14,7 +14,7 @@
 #![allow(clippy::all)]
 #![no_std]
 
-#[cfg(feature = "fuzzing")]
+#[cfg(any(feature = "fuzzing", feature = "regicide-dump"))]
 extern crate std;
 
 extern crate alloc;
@@ -1222,6 +1222,19 @@ pub enum AllocationKind {
 /// The ids used in [`Block`] and [`VReg`] must start their numbering
 /// at zero and be sequential.
 pub trait Function {
+    // --------
+    // Identity
+    // --------
+
+    /// What this function is called, if it has a name.
+    ///
+    /// Diagnostic only: nothing about the allocation depends on it. It names
+    /// the files the `regicide-dump` feature writes, so that a capture can be
+    /// traced back to the function it came from.
+    fn name(&self) -> Option<&str> {
+        None
+    }
+
     // -------------
     // CFG traversal
     // -------------

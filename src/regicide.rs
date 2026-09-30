@@ -56,6 +56,9 @@ use core::{iter, slice};
 use ::regicide as rgc;
 use ::regicide::Entity as _;
 
+#[cfg(feature = "regicide-dump")]
+mod dump;
+
 /// The number of regalloc2 register classes.
 const NUM_CLASSES: usize = 3;
 
@@ -1522,6 +1525,12 @@ pub(crate) fn run<F: Function>(
     // `regicide::run` asserts this, and a `Context` kept across runs is not
     // reset when the run that used it last finished with it.
     context.reset();
+
+    // Captured before the run, so that an allocation that never returns still
+    // leaves its input behind.
+    #[cfg(feature = "regicide-dump")]
+    dump::maybe_dump(&input, func);
+
     let result = rgc::run(context, &input).map_err(map_run_error)?;
 
     translate_output(func, machine, &adaptor, &result, output, spillslot_map)
