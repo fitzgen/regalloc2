@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+#
+# Profile a Wasm program's execution under `samply-text`.
+#
+# The module is compiled ahead of time so that the profile shows the program
+# running rather than Cranelift compiling it, and the run is repeated for a
+# fixed span, because one iteration of a small program is too few samples to
+# read anything off.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: profile [OPTIONS] path/to/wasm
+
+Profile the Wasm program's execution and print the profile to stdout.
+
+options:
+  --loop SECS            keep re-running the program for this many seconds,
+                         or 0 to run it exactly once (default: 5)
+  --regalloc WHICH       compile with this allocator: `regicide` or
+                         `backtracking` (default: regicide)
+  -h, --help             print this message
+
+Every other option is forwarded to `samply-text record`, e.g. `-t` for a call
+tree or `-n 100` for more rows. Anything after `--` is passed to the Wasm
+program as its own arguments.
+
+Note that the flat view is topped by Wasmtime's idle threads parked in the
+async runtime, which are asleep rather than working. The guest's own frames sit
+under `array_call_native`, so `-t -n 200` is usually the view you want.
+EOF
+}
+
+loop_secs=5
+regalloc=regicide
+wasm=
+samply_args=()
+guest_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --loop)     loop_secs="${2:?--loop needs a value}"; shift 2 ;;
+        --regalloc) regalloc="${2:?--regalloc needs a value}"; shift 2 ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; guest_args=(${1+"$@"}); break ;;
+        # `samply-text record`'s own flags, which all take a value.
+        -r|--rate|-n|--rows|--color|-s|--threshold)
+            samply_args+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+        -t|--tree|-c|--collapse-recursion|--no-symbolicate)
+            samply_args+=("$1"); shift ;;
+        -*)         samply_args+=("$1"); shift ;;
+        *)
+            if [[ -z "$wasm" ]]; then wasm="$1"; shift
+            else echo "unexpected argument $1" >&2; exit 2
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$wasm" ]] || { echo "no wasm given" >&2; usage >&2; exit 2; }
+[[ -f "$wasm" ]] || { echo "no such wasm: $wasm" >&2; exit 1; }
+
+case "$regalloc" in
+    regicide|backtracking) ;;
+    *) echo "--regalloc wants regicide or backtracking, not $regalloc" >&2; exit 2 ;;
+esac
+
+if ! [[ "$loop_secs" =~ ^[0-9]+$ ]]; then
+    echo "--loop wants a non-negative integer, not $loop_secs" >&2
+    exit 2
+fi
+
+command -v samply-text >/dev/null || {
+    echo "samply-text is not on PATH; cargo install samply-text" >&2
+    exit 1
+}
+
+wasm="$(cd "$(dirname "$wasm")" && pwd)/$(basename "$wasm")"
+wasm_dir="$(dirname "$wasm")"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cwasm="$work/$(basename "${wasm%.*}").cwasm"
+
+# Wasmtime's `profiling` profile is an optimized build that keeps line tables,
+# so the frames symbolicate instead of coming back as bare offsets.
+echo "compiling $wasm with $regalloc..." >&2
+cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" --profile profiling \
+    -- compile \
+    -O "regalloc-algorithm=$regalloc" \
+    -o "$cwasm" \
+    "$wasm" >&2
+
+# Build the runner once, up front, so that `cargo` neither appears in the
+# profile nor holds its build lock while we are sampling.
+echo "building wasmtime..." >&2
+cargo build --manifest-path "$REPO/wasmtime/Cargo.toml" --profile profiling >&2
+wasmtime="$REPO/wasmtime/target/profiling/wasmtime"
+
+# `--profile=perfmap` writes a symbol map for the JIT-compiled Wasm, without
+# which the program's own frames come back as bare offsets, which is the part
+# of the profile most worth reading here.
+run=("$wasmtime" run --profile=perfmap --allow-precompiled
+     -W unknown-imports-default -S cli --dir "$wasm_dir::." "$cwasm"
+     ${guest_args[@]+"${guest_args[@]}"})
+
+if [[ "$loop_secs" -eq 0 ]]; then
+    target=("${run[@]}")
+else
+    # A shell loop would be simpler, but macOS signs `/bin/sh` in a way that
+    # blocks the library injection samply relies on, so the loop has to run in
+    # a binary we compile ourselves. samply does follow children, so the
+    # program's own samples are attributed normally either way.
+    driver="$work/loop-driver"
+    cat > "$work/loop-driver.rs" <<'DRIVER'
+//! Re-run a command until a deadline passes, for profiling a program that is
+//! too short-lived to sample on its own.
+
+use std::{
+    env,
+    process::Command,
+    time::{Duration, Instant},
+};
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let secs: u64 = args.next().expect("seconds").parse().expect("seconds");
+    let argv: Vec<String> = args.collect();
+    let deadline = Duration::from_secs(secs);
+    let start = Instant::now();
+    let mut runs = 0u64;
+
+    while start.elapsed() < deadline {
+        let status = Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+            .expect("could not spawn the command");
+        runs += 1;
+        // Stop at the first failure: every later iteration would fail the same
+        // way, and the samples up to here are not worth reading.
+        if !status.success() {
+            eprintln!("loop-driver: the command failed with {status} on run {runs}");
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    eprintln!(
+        "loop-driver: {runs} run(s) in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
+}
+DRIVER
+    rustc -O -g -o "$driver" "$work/loop-driver.rs" >&2
+    target=("$driver" "$loop_secs" "${run[@]}")
+fi
+
+if [[ "$loop_secs" -eq 0 ]]; then
+    echo "profiling a single run..." >&2
+else
+    echo "profiling for ${loop_secs}s..." >&2
+fi
+exec samply-text record ${samply_args[@]+"${samply_args[@]}"} -- "${target[@]}"

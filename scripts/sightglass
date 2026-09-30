@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# Run Sightglass benchmarks against this checkout's Wasmtime, comparing
+# register allocators.
+#
+# The same `libwasmtime_bench_api.dylib` is passed to Sightglass once per
+# allocator, each with its own `-O regalloc-algorithm=...`, so a run compares
+# allocators rather than builds.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGHTGLASS="${SIGHTGLASS:-$HOME/sightglass}"
+
+usage() {
+    cat <<'EOF'
+usage: sightglass [OPTIONS] [BENCHMARKS...]
+
+Run Sightglass benchmarks, comparing register allocators. Writes CSV to stdout.
+
+  BENCHMARKS...          `*.wasm` or `*.suite` paths, relative to the
+                         Sightglass checkout when not found as given
+                         (default: benchmarks/pca.suite)
+
+options:
+  -r, --regalloc WHICH   which allocator(s) to benchmark: `regicide`,
+                         `backtracking`, or `both` (default: both)
+  -p, --phase PHASE      benchmark phase: `compilation`, `instantiation`,
+                         `execution`, or `all` (default: execution)
+  -m, --measure MEASURE  what to record, as Sightglass's `-m`
+                         (default: insts-retired)
+  -i, --iterations N     total samples per benchmark (default: 3 for
+                         insts-retired, otherwise 30)
+  -h, --help             print this message
+
+Anything after `--` is forwarded to `sightglass-cli benchmark`.
+EOF
+}
+
+regalloc=both
+phase=execution
+measure=insts-retired
+iterations=
+benchmarks=()
+extra=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--regalloc) regalloc="${2:?--regalloc needs a value}"; shift 2 ;;
+        -p|--phase)    phase="${2:?--phase needs a value}"; shift 2 ;;
+        -m|--measure)  measure="${2:?--measure needs a value}"; shift 2 ;;
+        -i|--iterations) iterations="${2:?--iterations needs a value}"; shift 2 ;;
+        -h|--help)     usage; exit 0 ;;
+        --)            shift; extra=(${1+"$@"}); break ;;
+        -*)            echo "unknown flag $1" >&2; usage >&2; exit 2 ;;
+        *)             benchmarks+=("$1"); shift ;;
+    esac
+done
+
+case "$regalloc" in
+    regicide)     algorithms=(regicide) ;;
+    backtracking) algorithms=(backtracking) ;;
+    both)         algorithms=(regicide backtracking) ;;
+    *) echo "--regalloc wants regicide, backtracking or both, not $regalloc" >&2; exit 2 ;;
+esac
+
+case "$phase" in
+    compilation|instantiation|execution|all) ;;
+    *) echo "--phase wants compilation, instantiation, execution or all, not $phase" >&2; exit 2 ;;
+esac
+
+# Sightglass takes a sample count as processes x iterations-per-process. The
+# execution phase measures three iterations in one process, so the requested
+# total is spread over processes; every other phase measures once per process.
+if [[ -z "$iterations" ]]; then
+    if [[ "$measure" == insts-retired ]]; then iterations=3; else iterations=30; fi
+fi
+if ! [[ "$iterations" =~ ^[0-9]+$ ]] || [[ "$iterations" -lt 1 ]]; then
+    echo "--iterations wants a positive integer, not $iterations" >&2
+    exit 2
+fi
+
+if [[ "$phase" == execution ]]; then
+    iters_per_process=3
+    processes=$(( (iterations + 2) / 3 ))
+else
+    iters_per_process=1
+    processes="$iterations"
+fi
+
+if [[ ${#benchmarks[@]} -eq 0 ]]; then
+    benchmarks=("$SIGHTGLASS/benchmarks/pca.suite")
+fi
+
+# Resolve each benchmark against the Sightglass checkout, since that is where
+# the suites and `*.wasm` files live.
+resolved=()
+for bench in "${benchmarks[@]}"; do
+    if [[ -e "$bench" ]]; then
+        resolved+=("$(cd "$(dirname "$bench")" && pwd)/$(basename "$bench")")
+    elif [[ -e "$SIGHTGLASS/$bench" ]]; then
+        resolved+=("$SIGHTGLASS/$bench")
+    else
+        echo "no such benchmark: $bench" >&2
+        exit 1
+    fi
+done
+
+echo "building wasmtime-bench-api..." >&2
+cargo build --manifest-path "$REPO/wasmtime/Cargo.toml" --release -p wasmtime-bench-api >&2
+
+case "$(uname -s)" in
+    Darwin) lib="libwasmtime_bench_api.dylib" ;;
+    *)      lib="libwasmtime_bench_api.so" ;;
+esac
+engine="$REPO/wasmtime/target/release/$lib"
+[[ -f "$engine" ]] || { echo "no engine at $engine" >&2; exit 1; }
+
+# One `-e` per allocator, each with the flags and the name that distinguish it;
+# without `-n` both engines would report under the same dylib name.
+engine_args=()
+for algorithm in "${algorithms[@]}"; do
+    engine_args+=(-e "$engine" --engine-flags "-O regalloc-algorithm=$algorithm" -n "$algorithm")
+done
+
+phase_args=()
+[[ "$phase" != all ]] && phase_args=(--benchmark-phase "$phase")
+
+echo "benchmarking ${algorithms[*]}: $phase phase, $measure, $processes process(es) x $iters_per_process iteration(s)" >&2
+
+# Run from the Sightglass checkout so that relative paths inside a `*.suite`
+# resolve, and so `sightglass-cli` builds against its own manifest.
+cd "$SIGHTGLASS"
+
+exec cargo run --release -q -- benchmark \
+    "${engine_args[@]}" \
+    ${phase_args[@]+"${phase_args[@]}"} \
+    -m "$measure" \
+    --processes "$processes" \
+    --iterations-per-process "$iters_per_process" \
+    --raw -f csv \
+    ${extra[@]+"${extra[@]}"} \
+    -- "${resolved[@]}"

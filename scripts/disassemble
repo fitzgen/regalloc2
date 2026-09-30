@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# Disassemble a Wasm module's compiled functions.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: disassemble [COMPILE_OPTIONS] path/to/the.wasm [-- OBJDUMP_OPTIONS]
+
+Compile the module and print a disassembly of its functions.
+
+  COMPILE_OPTIONS   forwarded to `wasmtime compile`, e.g.
+                    `-O regalloc-algorithm=backtracking`
+  OBJDUMP_OPTIONS   forwarded to `wasmtime objdump`, e.g. `--funcs all`
+                    or `--addresses`
+
+  -h, --help        print this message
+EOF
+}
+
+wasm=
+compile_args=()
+objdump_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --)        shift; objdump_args=(${1+"$@"}); break ;;
+        # `wasmtime compile`'s options are `-O key=val` and friends, whose
+        # value may be either attached or separate.
+        -O|-C|-D|-W|-S|-R|--target)
+            compile_args+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+        -*)        compile_args+=("$1"); shift ;;
+        *)
+            if [[ -z "$wasm" ]]; then wasm="$1"; shift
+            else echo "unexpected argument $1" >&2; exit 2
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$wasm" ]] || { echo "no wasm given" >&2; usage >&2; exit 2; }
+[[ -f "$wasm" ]] || { echo "no such wasm: $wasm" >&2; exit 1; }
+
+# Written beside the module, as the usage's `path/to/the.cwasm` says, so that a
+# disassembly can be diffed against a rebuild of the same module.
+cwasm="${wasm%.*}.cwasm"
+
+cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" \
+    -- compile \
+    ${compile_args[@]+"${compile_args[@]}"} \
+    -o "$cwasm" \
+    "$wasm" >&2
+
+exec cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" \
+    -- objdump \
+    ${objdump_args[@]+"${objdump_args[@]}"} \
+    "$cwasm"

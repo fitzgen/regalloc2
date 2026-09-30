@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# Visualize regicide's register allocations for a Wasm module's compilation.
+#
+# Compiles the module with `REGICIDE_DUMP` set, which captures the input to
+# every regicide allocation as JSON, then renders each capture with regicide's
+# `visualize` example.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: visualize [OPTIONS] path/to/wasm path/to/out
+
+Write an HTML visualization of each of the module's register allocations into
+the output directory.
+
+options:
+  -f, --filter FUNC   only visualize functions whose name matches FUNC
+                      (a POSIX extended regex, matched case-insensitively)
+  -h, --help          print this message
+
+Anything after `--` is forwarded to `wasmtime compile`.
+EOF
+}
+
+filter=
+wasm=
+out=
+extra=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--filter) filter="${2:?--filter needs a value}"; shift 2 ;;
+        -h|--help)   usage; exit 0 ;;
+        --)          shift; extra=(${1+"$@"}); break ;;
+        -*)          echo "unknown flag $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -z "$wasm" ]]; then wasm="$1"
+            elif [[ -z "$out" ]]; then out="$1"
+            else echo "unexpected argument $1" >&2; exit 2
+            fi
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$wasm" ]] || { echo "no wasm given" >&2; usage >&2; exit 2; }
+[[ -n "$out" ]]  || { echo "no output directory given" >&2; usage >&2; exit 2; }
+[[ -f "$wasm" ]] || { echo "no such wasm: $wasm" >&2; exit 1; }
+
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+wasm="$(cd "$(dirname "$wasm")" && pwd)/$(basename "$wasm")"
+
+# Dumps land beside the visualizations rather than in the output directory
+# itself, so that a rerun's captures cannot be mistaken for last run's pages.
+dumps="$out/dumps"
+rm -rf "$dumps"
+mkdir -p "$dumps"
+
+# `cache=n` because a cache hit would skip compilation altogether and capture
+# nothing, and `parallel-compilation=n` to keep the dump counter in the order
+# the functions appear.
+echo "compiling $wasm..." >&2
+REGICIDE_DUMP="$dumps" cargo run \
+    --manifest-path "$REPO/wasmtime/Cargo.toml" \
+    --features regicide-dump \
+    -- compile \
+    -O regalloc-algorithm=regicide \
+    -C cache=n \
+    -C parallel-compilation=n \
+    -o "$out/compiled.cwasm" \
+    ${extra[@]+"${extra[@]}"} \
+    "$wasm" >&2
+
+shopt -s nullglob
+captures=("$dumps"/*.json)
+shopt -u nullglob
+
+if [[ ${#captures[@]} -eq 0 ]]; then
+    echo "no regicide inputs were captured; does this module have any functions?" >&2
+    exit 1
+fi
+
+echo "building regicide's visualize example..." >&2
+cargo build --manifest-path "$REPO/regicide/Cargo.toml" \
+    --example visualize \
+    --features visualizer,test-utils,deserialize >&2
+visualize="$REPO/regicide/target/debug/examples/visualize"
+
+rendered=0
+skipped=0
+failed=0
+for capture in "${captures[@]}"; do
+    name="$(basename "$capture" .json)"
+
+    # A capture's name is `<pid>-<counter>[-<function>]`, so the function is
+    # what follows the counter; a function with no name leaves nothing to match.
+    func="$(echo "$name" | sed -E 's/^[0-9]+-[0-9]+-?//')"
+    if [[ -n "$filter" ]] && ! echo "$func" | grep -Eqi -- "$filter"; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # A single allocation that cannot be rendered should not sink the rest:
+    # the interesting function is often exactly the one that fails.
+    if "$visualize" --input "$capture" "$out/$name.html" >/dev/null 2>"$out/$name.log"; then
+        rm -f "$out/$name.log"
+        rendered=$((rendered + 1))
+        echo "  $out/$name.html" >&2
+    else
+        failed=$((failed + 1))
+        echo "  could not visualize $name; see $out/$name.log" >&2
+    fi
+done
+
+echo "rendered $rendered visualization(s) into $out" >&2
+[[ "$skipped" -gt 0 ]] && echo "skipped $skipped not matching --filter $filter" >&2
+[[ "$failed" -gt 0 ]] && echo "failed to render $failed" >&2
+
+# Nothing rendered is a failure when a filter matched nothing, too: the caller
+# asked for a visualization and got none.
+[[ "$rendered" -gt 0 ]] || exit 1
+exit 0

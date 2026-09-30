@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# Compile a Wasm module with register allocation logging turned on.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: log [OPTIONS] path/to/wasm
+
+Compile the module with register allocation logging enabled, writing the log
+to stderr.
+
+  OPTIONS     forwarded to `wasmtime compile`, e.g.
+              `-O regalloc-algorithm=backtracking`
+  -h, --help  print this message
+
+`WASMTIME_LOG` is honored if already set, so a narrower target can be selected:
+
+  WASMTIME_LOG=regicide::spill_placement=trace ./scripts/log the.wasm
+EOF
+}
+
+wasm=
+compile_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -O|-C|-D|-W|-S|-R|--target)
+            compile_args+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+        -*)        compile_args+=("$1"); shift ;;
+        *)
+            if [[ -z "$wasm" ]]; then wasm="$1"; shift
+            else echo "unexpected argument $1" >&2; exit 2
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$wasm" ]] || { echo "no wasm given" >&2; usage >&2; exit 2; }
+[[ -f "$wasm" ]] || { echo "no such wasm: $wasm" >&2; exit 1; }
+
+# Left alone when already set, so that a caller who wants one module or one
+# pass can say so instead of reading everything.
+export WASMTIME_LOG="${WASMTIME_LOG:-cranelift_codegen::machinst::compile=trace,cranelift_codegen::timing=trace,regalloc2=trace,regicide=trace}"
+
+# The output is thrown away: this compiles for the log, not for the artifact.
+# `cache=n` because a cache hit would log nothing, and
+# `parallel-compilation=n` to keep each function's records together.
+exec cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" \
+    --features trace-log \
+    -- compile \
+    -C cache=n \
+    -C parallel-compilation=n \
+    -o "$(mktemp)" \
+    ${compile_args[@]+"${compile_args[@]}"} \
+    "$wasm"

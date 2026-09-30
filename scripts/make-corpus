@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+#
+# Build a corpus of regicide register allocation inputs from Wasm modules.
+#
+# Compiling a module captures the input to every regicide allocation it
+# performs; collecting those into one directory gives a fixed workload to
+# replay with `regicide/examples/run.rs`, so that measuring a regicide change
+# costs an allocation rather than a Wasmtime rebuild.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: make-corpus [OPTIONS] path/to/out path/to/wasm...
+
+Compile each Wasm module with regicide and collect the register allocation
+inputs it captures into the output directory, one JSON file per allocation.
+
+  path/to/out    directory to write the corpus into, created if absent and
+                 added to if it already holds a corpus
+  path/to/wasm   the modules or components to compile
+
+options:
+  -c, --clean    empty the output directory first, rather than adding to it
+  -h, --help     print this message
+
+Replay the result with:
+
+  cargo run --manifest-path regicide/Cargo.toml --example run -- path/to/out
+
+Anything after `--` is forwarded to `wasmtime compile`.
+EOF
+}
+
+clean=no
+out=
+wasms=()
+extra=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--clean) clean=yes; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; extra=(${1+"$@"}); break ;;
+        -*)         echo "unknown flag $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -z "$out" ]]; then out="$1"
+            else wasms+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$out" ]] || { echo "no output directory given" >&2; usage >&2; exit 2; }
+[[ ${#wasms[@]} -gt 0 ]] || { echo "no wasm given" >&2; usage >&2; exit 2; }
+
+for wasm in "${wasms[@]}"; do
+    [[ -f "$wasm" ]] || { echo "no such wasm: $wasm" >&2; exit 1; }
+done
+
+[[ "$clean" == yes ]] && rm -rf "$out"
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+
+echo "building wasmtime with regicide-dump..." >&2
+cargo build --manifest-path "$REPO/wasmtime/Cargo.toml" --features regicide-dump >&2
+wasmtime="$REPO/wasmtime/target/debug/wasmtime"
+
+staging="$(mktemp -d)"
+trap 'rm -rf "$staging"' EXIT
+
+# Reduce a module's path to the `<module>` part of a capture's name. Only the
+# base name: two corpora built from different checkouts of the same benchmark
+# should agree, and a full path does not fit in a file name anyway.
+slug() {
+    basename "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/\.(wasm|wat|cwasm)$//; s/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+total=0
+empty=()
+
+for wasm in "${wasms[@]}"; do
+    module="$(slug "$wasm")"
+    [[ -n "$module" ]] || module=module
+
+    # A module compiles into its own staging directory because the capture
+    # counter restarts at zero for every process and knows nothing about what
+    # is already on disk: compiling straight into a shared corpus would let one
+    # module's captures overwrite another's.
+    dumps="$staging/$module"
+    rm -rf "$dumps"
+    mkdir -p "$dumps"
+
+    echo "compiling $wasm..." >&2
+    # `cache=n` because a cache hit skips compilation and captures nothing, and
+    # `parallel-compilation=n` to number the captures in function order.
+    REGICIDE_DUMP="$dumps" "$wasmtime" compile \
+        -O regalloc-algorithm=regicide \
+        -C cache=n \
+        -C parallel-compilation=n \
+        -o "$staging/$module.cwasm" \
+        ${extra[@]+"${extra[@]}"} \
+        "$wasm" >&2
+
+    shopt -s nullglob
+    captures=("$dumps"/*.json)
+    shopt -u nullglob
+
+    if [[ ${#captures[@]} -eq 0 ]]; then
+        echo "  captured nothing" >&2
+        empty+=("$wasm")
+        continue
+    fi
+
+    count=0
+    for capture in "${captures[@]}"; do
+        # A capture is named `<pid>-<counter>[-<function>]`. The pid says
+        # nothing once the module name is in the name, and dropping it makes
+        # rebuilding the corpus overwrite the old names rather than pile new
+        # ones beside them.
+        rest="$(basename "$capture" .json | sed -E 's/^[0-9]+-//')"
+        name="$module-$rest"
+
+        # Two modules can share a base name, so a name already taken gets a
+        # suffix rather than clobbering what is there.
+        dest="$out/$name.json"
+        if [[ -e "$dest" ]]; then
+            dup=2
+            while [[ -e "$out/$name-$dup.json" ]]; do dup=$((dup + 1)); done
+            dest="$out/$name-$dup.json"
+        fi
+
+        mv "$capture" "$dest"
+        count=$((count + 1))
+    done
+
+    echo "  captured $count input(s)" >&2
+    total=$((total + count))
+done
+
+echo "wrote $total input(s) to $out" >&2
+
+if [[ ${#empty[@]} -gt 0 ]]; then
+    echo "captured nothing from ${#empty[@]} module(s):" >&2
+    for wasm in "${empty[@]}"; do echo "  $wasm" >&2; done
+    exit 1
+fi
