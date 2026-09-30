@@ -1514,7 +1514,11 @@ pub(crate) fn run<F: Function>(
     };
     let input_options = rgc::InputOptions {
         validate_input: options.validate_ssa || cfg!(debug_assertions),
-        move_elimination_level: options.move_elimination_level,
+        // One knob here drives both of regicide's, which is all
+        // `RegallocOptions` can say; the rest keep regicide's defaults.
+        redundant_move_elimination_level: options.move_elimination_level,
+        dead_move_elimination_level: options.move_elimination_level,
+        ..rgc::InputOptions::new()
     };
     let input = rgc::Input {
         options: &input_options,
