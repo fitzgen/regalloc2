@@ -121,6 +121,21 @@ Wins get recorded precisely because the next change can silently undo them.
 
 One per benchmark, same shape for both directions.
 
+Two rules specific to these files:
+
+1. **Name both metrics in the title when they disagree**, e.g.
+   `-2.23% instructions but +7.38% cycles`. A title quoting only the
+   instruction delta misdescribes the benchmark.
+2. **If the `cycles` row is still pending, the prose must not characterize
+   severity.** Write the mechanism — what differs, why the allocator did it,
+   what in its design led there — and leave the "how bad is it" sentence until
+   cycles lands. In one session three per-benchmark reports had to be revised
+   because severity was written from instruction counts.
+
+A benchmark can also belong in `regressions/` by instruction count while being
+a *win* on cycles. Keep it where the ranking put it, and say so plainly at the
+top rather than silently filing it under the other direction.
+
 ```markdown
 # <benchmark> — regicide <+12.06% / -10.93%>
 
@@ -129,7 +144,11 @@ One per benchmark, same shape for both directions.
 | metric | backtracking | regicide | delta | significant |
 | --- | --- | --- | --- | --- |
 | insts-retired | 900,271 | 791,710 | +12.06% | yes |
-| cycles | 412,003 | 374,551 | +9.1% | yes |
+| cycles (`-i 30`) | 412,003 | 374,551 | +9.1% | yes |
+
+<!-- When cycles resolved and disagrees in direction or magnitude, say so here
+     in a sentence, with the robust estimators (median / trimmed / minimum) so
+     a reader can judge it. See references/measurement.md. -->
 
 Reproduce the compile with logging:
 
@@ -154,7 +173,7 @@ Replay its allocation:
 ```bash
 cd ~/regalloc2/regicide
 RUST_LOG=trace cargo run --all-features --example run -- \
-    ../reports/codegen-analysis-NNN/corpus/hashset-benchmark-0012-<function>.json
+    ../reports/codegen-analysis-NNN/corpus/hashset-0012-<function>.postcard
 ```
 
 Disassemble it under both allocators:
@@ -231,4 +250,11 @@ from. Worth writing as you go:
 | `preflight.md` | The §1 check that the two allocators really differ, and its result. |
 | `environment.md` | Tool gotchas, build times, anything that cost you time and would cost the next person the same. |
 | `skill-feedback.md` | What this skill got wrong, omitted, or should say differently. Read it when next updating the skill. |
-| `dead-ends.md` | What you investigated that went nowhere, so nobody repeats it. |
+| `dead-ends.md` | What you investigated that went nowhere, so nobody repeats it. Include explanations you *ruled out*, not just paths you abandoned — "splits do not lose hints, here is the code" is as valuable as a positive finding. |
+
+**When the analysis is done, fold the durable conclusions into
+`references/known-findings.md` in the skill itself** — the mechanisms, their
+status (confirmed in code / source-only / hypothesis), what was ruled out, and
+the open questions. `misc/` is the evidence for *this* run; `known-findings.md`
+is what the next run should not have to rediscover. Keep the per-run files as
+the citations it points at.

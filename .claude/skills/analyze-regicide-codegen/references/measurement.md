@@ -38,23 +38,115 @@ of this skill, and the honest answer is often "cycles was inconclusive".
 
 ### The policy
 
-**Screen with `insts-retired` over the whole suite; confirm the extremes with
-`cycles` at a high sample count.** Spending 30 iterations of cycles on 40
-benchmarks to read 10 of them is waste.
+**Screen with `insts-retired`; confirm with `cycles` — and launch the cycles run
+early, not as a closing formality.** Spending 30 iterations of cycles on 40
+benchmarks to read 10 of them is waste, but so is writing up severity from
+instruction counts and then having to revise it.
+
+A cheap three-step that avoids both:
 
 ```bash
-# Screen: whole suite, cheap.
-./scripts/sightglass > $R/sightglass-data/screen-insts-retired.csv
+# 1. Subset screen: five or six small benchmarks, ~4 minutes. Enough to pick
+#    targets, and it does not block on the full screen.
+./scripts/sightglass -i 5 \
+    benchmarks/shootout/shootout-heapsort.wasm \
+    benchmarks/shootout/shootout-keccak.wasm \
+    > $R/sightglass-data/subset-insts-retired.csv
 
-# Confirm: just the benchmarks you will write about.
+# 2. Cycles on those picks, in the background, BEFORE the deep analysis.
 ./scripts/sightglass -m cycles -i 30 \
-    benchmarks/bz2/benchmark.wasm benchmarks/hashset/benchmark.wasm \
+    benchmarks/shootout/shootout-heapsort.wasm \
+    benchmarks/shootout/shootout-keccak.wasm \
     > $R/sightglass-data/confirm-cycles.csv
+
+# 3. Whole suite, also in the background. The authority for ranking and for any
+#    suite-wide claim, but ~70 minutes on pca.suite — nothing should wait on it.
+./scripts/sightglass > $R/sightglass-data/screen-insts-retired.csv
 ```
+
+Observed agreement between (1) and (3): `shootout-sieve` came back at **-2.23%
+in both**, `shootout-keccak` at -11.00% / -11.06%. A cheap subset screen is a
+good substitute for picking targets.
+
+One exception worth knowing: a benchmark can be *significant* in a `-i 5` subset
+run and *insignificant* in the `-i 3` full screen, purely on sample count —
+`shootout-heapsort` was -15.06% significant in one and -12.72% not significant
+in the other. Take the higher-sample number, and note that the low-power run
+*understated* a real regression rather than inventing one.
 
 If cycles does not resolve, **say so in the report** and rank by
 `insts-retired`. Do not promote a noisy cycles number to a finding, and do not
 quietly drop the metric you said you would measure.
+
+### Separate mechanism from magnitude, and do not state severity before cycles
+
+**The most expensive mistake available here.** `insts-retired` is an excellent
+*mechanism detector* — quiet enough to rank 17 benchmarks at `-i 3`, and it
+pointed straight at every real mechanism in the last full run. It is a **bad
+cost estimator** for a register allocator, because the difference is usually
+register-register moves, which is precisely its blind spot.
+
+What one session actually measured:
+
+| benchmark | insts-retired | cycles | |
+| --- | ---: | ---: | --- |
+| `shootout-switch` | -237.23% | **-53.39%** | significant — a 1.53x slowdown |
+| `shootout-heapsort` | -15.06% | **-1.15%** | not significant — ~10x smaller |
+| `shootout-keccak` | -11.00% | **-1.15%** | not significant |
+| `shootout-sieve` | -2.23% | **+7.38%** | significant — **a win** |
+
+Three things follow, and each cost rework to learn:
+
+1. **A benchmark filed as a regression was a win.** `shootout-sieve`'s hot
+   function emits 37 *more* moves than ion's with identical stack traffic, and
+   runs ~6% faster. Move-only regressions of that size are not where the cost
+   is.
+2. **The overstatement factor varies**, so you cannot apply a correction: ~10x
+   on the small benchmarks, ~4.4x on the one with real fan-out.
+3. **"Excess moves are cheap" is a conclusion reachable from an
+   unrepresentative sample.** The same mechanism that cost ~1% at a loop exit
+   cost 53% of wall-clock time on `shootout-switch`, where jump-table fan-out
+   multiplied it ~4,000 times and produced 5.2x the code. The honest finding is
+   **cheap per occurrence, severe where the code shape multiplies it** — and you
+   cannot tell which case you are in from instruction counts.
+
+So: write the mechanism up as soon as you have it, with event-log and
+disassembly evidence. Leave the severity sentence until cycles lands. The
+mechanism findings in that session survived both metrics untouched; every
+magnitude moved.
+
+### Check robustness before believing any cycles result
+
+A surprising cycles number deserves the same scrutiny whichever direction it
+points. Four cheap checks, all from the raw CSV:
+
+```python
+import csv, collections, statistics as st
+d = collections.defaultdict(list)
+for r in csv.DictReader(open(csvfile)):
+    d[r['engine']].append(int(r['count']))
+bt, rg = sorted(d['backtracking']), sorted(d['regicide'])
+k = len(bt) // 5
+f = lambda a, c: 100 * (a - c) / a
+print("mean       ", f(st.mean(bt), st.mean(rg)))
+print("median     ", f(st.median(bt), st.median(rg)))
+print("20%-trimmed", f(st.mean(bt[:-k]), st.mean(rg[:-k])))
+print("minimum    ", f(bt[0], rg[0]))   # least noise-contaminated sample
+print("CV%        ", 100*st.stdev(bt)/st.mean(bt), 100*st.stdev(rg)/st.mean(rg))
+```
+
+This is what distinguished the real results from the noise in that session:
+
+- `shootout-switch` -53.39%: held at every estimator down to **-36.64%**
+  minimum-to-minimum, and backtracking's *slowest* sample beat regicide's
+  *median*. Believable.
+- `shootout-sieve` +7.38%: held at median +5.43%, trimmed +5.61%, minimum
+  +6.08%. Believable.
+- `hashset` -7.02%: **1.8x spread inside one engine's own 30 samples** (CV
+  13.9%). Not a result; reported as noise.
+
+Quote the minimum-to-minimum figure when a result matters — it is the most
+conservative framing and the least contaminated by scheduler noise.
 
 ### When they disagree
 
@@ -147,14 +239,32 @@ of `cycles` resolves essentially nothing. If the whole suite comes back
 insignificant, the run is the problem, not the allocator —
 `rank_benchmarks.py` says so explicitly and marks its picks as guesses.
 
-### 3. `Sum Total`
+### 3. `Sum Total` — on `pca.suite`, quoting it is a factor-of-24 error
 
 Sightglass appends a synthetic `Sum Total` benchmark that sums each sample's
 counts across the suite. It reaches significance far more readily than any
 individual benchmark, which makes it the headline number — and **it can hide a
-per-benchmark regression completely**. This skill is about per-benchmark
-behavior; report `Sum Total` as context, never as the result.
-`rank_benchmarks.py` keeps it out of the rankings for this reason.
+per-benchmark regression completely**.
+
+This is not a theoretical nuance on this suite. Measured:
+
+| | `insts-retired` |
+| --- | ---: |
+| `Sum Total` | **-0.84%** (significant) |
+| per-benchmark geomean | **-20.10%** |
+| benchmarks significantly slower | **12 of 17** |
+| benchmarks significantly faster | **0** |
+
+`Sum Total` understates the regression by roughly **24x**, because 97.8% of the
+suite's instruction count is in three benchmarks that are host-GC-bound,
+host-memcpy-bound, or unprofilable — and which duly came back at +0.00%, -0.26%
+and -0.37%. `Sum Total` is substantially a measurement of Wasmtime's runtime,
+not of either allocator. See §4 of `SKILL.md`.
+
+**So: never quote `Sum Total` as the result, and never compute a cost-weighted
+aggregate over this suite.** Treat each benchmark as one observation regardless
+of its absolute size, which is what `rank_benchmarks.py` does — it keeps
+`Sum Total` out of the rankings for this reason.
 
 ### 4. Preflight
 
@@ -184,9 +294,32 @@ Pass `--pin` through (`-- --pin`) to bind each process's iterations to one core,
 which cuts scheduling noise. On Apple Silicon the affinity API is advisory, so
 treat it as "can't hurt" rather than a guarantee.
 
-If a result will not resolve, quiet the host first — check `uptime` and
-`ps -Ao %cpu,comm -r` for backup daemons, file indexers and endpoint-security
-agents, which inject correlated outliers — then raise `-i`.
+**Quiet the host *before* you start, not after a result fails to resolve.**
+Check `uptime` and `ps -Ao %cpu,comm -r` in the first minute of the analysis —
+for backup daemons, file indexers, endpoint-security agents and your own stray
+`cargo` builds, all of which inject correlated outliers. Since `cycles` is the
+metric that actually decides, host quiescence is a precondition for the whole
+analysis, not a troubleshooting step.
+
+In one session the host sat at **load average ~27** throughout, with four
+`rustc` processes, binaries from another worktree, and Microsoft Defender at
+~58% CPU. The consequences were concrete:
+
+- **Four of six cycles measurements did not resolve.** Several probably would
+  have on an idle machine, which would have turned "unresolved" into real
+  severity numbers.
+- **`hashset` came back unusable** — 1.8x spread inside one engine's own 30
+  samples.
+- `insts-retired` was unaffected: two independent runs agreed to 0.00
+  percentage points on `shootout-sieve`. It counts the benchmark process's own
+  retired instructions rather than elapsed time, so **the instruction ranking
+  is trustworthy even on a loaded host** — which is a good reason to lean on it
+  for ranking and to be correspondingly sceptical of cycles numbers from the
+  same conditions.
+
+Beware also of competing for CPU with *yourself*: a whole-suite corpus build or
+a second disassembly running alongside a cycles measurement degrades the
+measurement you care about. Stop the lower-value job.
 
 ---
 

@@ -33,7 +33,9 @@ things worth looking for, roughly in descending order of how much they cost:
   a call, often because of a fixed-register or reuse constraint.
 - **More spill slots** than the other allocator used, i.e. a bigger frame.
 
-Count them, don't eyeball them. §"Virtual cycles" gives the arithmetic.
+Count them, don't eyeball them. §"Virtual cycles" gives the arithmetic, and
+§"Counting, mechanically" below gives the recipe — **read it before counting
+spills on arm64**, where the obvious approach silently misses all of them.
 
 **A benchmark regicide wins overall can still contain a block where it does
 something bad**, masked by a win elsewhere. Analyze the block on its own terms
@@ -89,7 +91,7 @@ than recompiling the module, and gives the same events:
 ```bash
 cd ~/regalloc2/regicide
 RUST_LOG=regicide::region_allocation=trace \
-  cargo run --all-features --example run -- ../$R/corpus/bz2-benchmark-0003-foo.json
+  cargo run --all-features --example run -- ../$R/corpus/bz2-0003-foo.postcard
 ```
 
 `references/tools.md` has the full table of log targets and the question each
@@ -149,6 +151,19 @@ eviction cost model undervalues a spill inside a loop, in
 `region_allocation.rs`" is a finding someone can act on; "regicide's heuristics
 are worse here" is not.
 
+**Check `references/known-findings.md` first.** Previous runs have already
+established several of these mechanisms with event-log evidence, and have ruled
+some explanations out — splits do *not* lose register hints, move elimination is
+*not* a limiter, and remat-vs-reload is *not* even available under Wasmtime.
+Starting there means a level-3 explanation either confirms a known mechanism on
+new code or finds a genuinely new one, rather than re-deriving.
+
+**And before proposing a fix, grep for it.** One previous run recommended adding
+cross-region register hinting; `hint_across_regions` had been there all along,
+and the actual finding was a level deeper — the hints are built and then
+discarded. A recommendation to add something that exists is worse than no
+recommendation.
+
 Reading the source is in scope and often the fastest route — just don't change
 it.
 
@@ -163,6 +178,102 @@ Each block analysis ends with one of:
   them.
 
 ---
+
+## Counting, mechanically
+
+Two recipes that between them found every mechanism in the last full run of this
+skill. Both are worth using before reading any individual block.
+
+### Spills on arm64 are `stur`/`ldur`, not `str`/`ldr`
+
+**A trap that silently produces a wrong finding.** Cranelift's spills and
+reloads against `sp` use the *unscaled* forms `stur`/`ldur`. An instruction-mix
+comparison that counts `str`/`ldr` therefore shows spill traffic as *unchanged*
+while it has in fact doubled — and the matching columns look reassuring:
+
+| | backtracking | regicide |
+| --- | ---: | ---: |
+| `ldr` (heap) | 38 | 38 |
+| `str` (heap) | 13 | 13 |
+| `ldur` from `[sp]` | 4 | **14** |
+| `stur` to `[sp]` | 4 | **6** |
+
+In that function, "no extra spills" was reported from the first two rows and was
+wrong; the real counts were 20 stack accesses against 8. **Filter on the
+addressing mode, not the mnemonic:**
+
+```bash
+grep -cE "(str|ldr|stur|ldur)\s+[a-z0-9]+, \[sp" the.asm
+```
+
+And note that **where** the stack accesses sit matters as much as how many. In
+that same function all 20 were outside the hot loop — both allocators' loops
+were spill-free — so the extra spilling cost almost nothing dynamically and was
+evidence of regicide's spill *placement* working. Counting function-wide would
+have scored a win as a loss.
+
+### A per-function instruction-mix table, before reading any block
+
+For each function, under both allocators: instruction count, stack accesses,
+and register-register moves. Sort by the delta that interests you. On a
+100,000-line disassembly a whole-file `diff` is unusable, but this localizes a
+regression in seconds — it took one pass to attribute `shootout-switch`'s
+81,610 surplus moves to a single function.
+
+```python
+import re
+stats = {}
+for name in ["backtracking", "regicide"]:
+    cur = None
+    for line in open(f"{R}/profiles/{bench}-{name}.asm"):
+        h = re.match(r'^[0-9a-f]{8} (wasm\[0\]::\S+):', line)
+        if h:
+            cur = h.group(1).split('::')[-1]
+            stats.setdefault(cur, {})[name] = [0, 0, 0]
+            continue
+        m = re.match(r'\s+[0-9a-f]+:\s+(\S+)\s*(.*)', line)
+        if m and cur:
+            v = stats[cur][name]
+            v[0] += 1                                          # instructions
+            if re.search(r'\[sp', m.group(2)): v[1] += 1       # stack refs (see note)
+            if m.group(1) == 'mov' and ', #' not in m.group(2):
+                v[2] += 1                                      # reg-reg moves
+```
+
+A note on that `[sp` column: it counts **every** reference to `sp`, which
+includes the `stp`/`ldp` pairs of callee-saved registers in the prologue and
+epilogue, not just spills. That is fine for *ranking* functions, which is what
+this table is for. When you need the actual spill and reload count for a
+virtual-cycle table, use the narrower filter from the previous section, which
+requires a single register operand:
+
+```bash
+grep -cE "(str|ldr|stur|ldur)\s+[a-z0-9]+, \[sp" the.asm
+```
+
+On one function those gave 32 and 20 respectively — the difference being frame
+setup. Quote the narrow number in a report, and say which you used.
+
+Two follow-ups from the same parse, both of which paid off:
+
+- **Distinct branch targets per function.** `shootout-switch` had 33 under
+  backtracking and 1,038 under regicide, which is what revealed ~1,000
+  materialized edge blocks and explained the whole regression.
+- **Runs of consecutive register-register moves.** A *permutation* (`x4<-x5`,
+  `x5<-x8`, `x8<-x11`, …) is the signature of two adjacent regions choosing
+  different registers for the same live values, reconciled on the edge between
+  them — quite different from a few independent copies. Counting runs of >= 4
+  found 3,992 of them, median length 19, holding 99.9% of one function's moves.
+
+### Check whether the function even has loops
+
+Run this before ranking "hot blocks": if there are **no backward branches**, the
+function is straight-line or fully unrolled, and there is no hottest block to
+find — every instruction executes about equally often. `keccak_core` is like
+this. That changes the method rather than being a degenerate case: static
+instruction counts become a direct proxy for dynamic cost, and the loop-depth
+weighting below does not apply. Say so in the report instead of inventing a
+block ranking.
 
 ## Virtual cycles: putting a number on one block
 

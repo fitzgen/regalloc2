@@ -26,6 +26,12 @@ This skill is steps 1 and 2 of a four-step loop:
 3. Implement optimizations based on that analysis. ← **you do not do this**
 4. Repeat.
 
+**Start by reading `references/known-findings.md`** — what previous runs
+established, with the evidence and status of each, plus the open questions in
+priority order. It will save you rediscovering the main finding, and it records
+two wrong turns a previous run actually took. Verify anything load-bearing still
+holds; regicide changes.
+
 **You are not responsible for changing regicide.** The user implements step 3
 themselves, elsewhere, in other branches and worktrees. Your deliverable is a
 report directory. Do not edit anything under `regicide/src/`, `src/`, or
@@ -89,26 +95,74 @@ the rest from reading one region of code.
 
 ## How to sequence the work
 
-Builds dominate the wall clock here: the first Wasmtime build of a given cargo
-profile takes tens of minutes, and `scripts/sightglass`, `scripts/profile`,
-`scripts/disassemble`/`log` and `scripts/make-corpus` between them want three
-different profiles (`release`, `profiling`, `debug`). **Start the long jobs in
-the background and write up the previous step while they run** — do not sit
-idle watching a build.
+Builds and benchmark runs dominate the wall clock. `scripts/sightglass`,
+`scripts/disassemble`/`log`/`make-corpus`/`visualize` all use the `release`
+profile; only `scripts/profile` differs, using `profiling` (optimized plus line
+tables). So there are **two** profiles to pay for, and the first build of each
+takes a few minutes with warm dependencies. **Start the long jobs in the
+background and write up the previous step while they run** — never sit idle
+watching a build.
+
+The expensive thing is not the builds, it is the **whole-suite screen**: on
+`pca.suite` it took ~70 minutes, because `splay` alone is 80% of the suite's
+execution cost. Sightglass buffers its CSV to the end, so a half-finished
+screen gives you nothing.
 
 A sequence that keeps the critical path short:
 
 1. §0 report skeleton (seconds).
-2. §1 preflight — the first `debug` Wasmtime build. Start it, then finish §0.
-3. §2 the `insts-retired` screen — the `release` build. Start it in the
-   background.
-4. §3 the whole-suite corpus — reuses the `debug` build. Start it in the
-   background too; it compiles every module in the suite.
-5. When the screen lands, rank it and launch the `cycles` confirmation run on
-   the picks, in the background.
-6. §4–§5 profile and analyze, benchmark by benchmark, writing each report as you
-   finish it. This is where the thinking happens and it needs no build.
-7. §6 aggregate report.
+2. **Check the host is quiet** — `uptime`, `ps -Ao %cpu,comm -r`. Do this
+   *first*, not when a result fails to resolve. `cycles` is the metric that
+   decides, and on a loaded machine it will not resolve; see §2.
+3. §1 preflight — the first `release` Wasmtime build. Start it, then finish §0.
+4. §2 a **cheap subset screen** over five or six small benchmarks (`-i 5`,
+   ~4 minutes). Pick ones whose hot code is genuinely Wasm rather than Wasmtime
+   host runtime — §4 says how to tell, and on `pca.suite` the three largest
+   benchmarks all fail that test. This is enough to choose targets, and gets
+   you to real analysis roughly an hour sooner than waiting for the full
+   screen.
+5. §2 the whole-suite `insts-retired` screen, in the background. It is the
+   authority for ranking and for any suite-wide claim, but nothing needs to
+   block on it.
+6. **Launch `cycles` on the subset picks as soon as you have them**, in the
+   background — *not* after the analysis. See the warning below.
+7. §3 per-module corpora for the benchmarks you are going to analyze.
+8. §4–§5 profile and analyze, benchmark by benchmark, writing each report as
+   you finish it. This is where the thinking happens.
+9. When the full screen lands, re-check your picks against it, and start the
+   disassembly of the worst regression immediately if it is not already
+   covered — it is usually the longest-running tool invocation you will issue.
+10. §6 aggregate report.
+
+### Launch `cycles` early, and do not write severity claims before it lands
+
+**The single most expensive mistake available in this workflow.** Instruction
+counts find the mechanism; they are a bad estimate of what it costs. For a
+register allocator the difference is usually register-register moves, which is
+exactly `insts-retired`'s blind spot — a `mov` and a cache-missing load both
+count as 1.
+
+Observed on `pca.suite` in one session:
+
+| benchmark | insts-retired | cycles |
+| --- | ---: | ---: |
+| `shootout-heapsort` | -15.06% | **-1.15%** (not significant) |
+| `shootout-keccak` | -11.00% | **-1.15%** (not significant) |
+| `shootout-sieve` | -2.23% | **+7.38% — a significant *win*** |
+| `shootout-switch` | -237.23% | **-53.39%** (significant) |
+
+Three lessons, in order of how much they cost to learn:
+
+- A benchmark filed as a regression on instructions was a **win** on cycles.
+- Instruction deltas overstated runtime cost by ~10x on the small benchmarks —
+  but only ~4.4x on the one with real fan-out, which stayed severe.
+- So **"excess moves are cheap" is a conclusion you can reach from an
+  unrepresentative sample.** The honest finding is "cheap per occurrence,
+  severe where the code shape multiplies it", and you cannot tell which case
+  you are in without cycles.
+
+Separate **mechanism** from **magnitude** in every report. The mechanism
+findings in that session survived both metrics untouched; every magnitude moved.
 
 ## 0. Set up the report directory
 
@@ -178,9 +232,9 @@ For reference, on 2026-09-30 this produced 2,398 lines for backtracking against
 2,444 for regicide, differing in register choices from the first block onwards —
 so a diff of a few thousand lines here is normal and expected.
 
-**This is also where you pay for the first Wasmtime `debug` build** — a couple
-of minutes when dependencies are warm, much longer from cold. Start it, then set
-up the report skeleton while it runs.
+**This is also where you pay for the first Wasmtime `release` build** — a few
+minutes when dependencies are warm, much longer from cold. Start it, then set up
+the report skeleton while it runs.
 
 ## 2. Run the benchmarks
 
@@ -189,18 +243,36 @@ once and hands the *same* dylib to sightglass twice, once per allocator, so a
 run compares allocators rather than builds. Full flag reference in
 `references/tools.md`.
 
-**Screen with `insts-retired`, confirm with `cycles`.** Instruction counts are
-quiet enough to rank the suite cheaply; cycles is the metric we care about but
-needs many more samples to resolve, so spend it only on the benchmarks you are
-going to write about.
+**Screen with `insts-retired`, confirm with `cycles`** — and run them in the
+order below, not sequentially. Instruction counts rank the suite cheaply and
+find every mechanism; cycles is the metric we care about, needs far more samples,
+and frequently will not resolve at all. Full policy and the reasoning in
+`references/measurement.md`.
 
 ```bash
 cd ~/regalloc2
 R=reports/codegen-analysis-001
 
-# Screen: the whole suite, insts-retired, cheap. CSV goes to stdout.
+# 1. Subset screen: a handful of small, Wasm-bound benchmarks. ~4 minutes, and
+#    enough to pick targets so the analysis is not blocked on the full screen.
+./scripts/sightglass -i 5 \
+    benchmarks/shootout/shootout-heapsort.wasm \
+    benchmarks/shootout/shootout-keccak.wasm \
+    benchmarks/shootout/shootout-sieve.wasm \
+    > $R/sightglass-data/subset-insts-retired.csv
+
+# 2. Cycles on those picks, in the background, BEFORE the deep analysis.
+#    Do not leave this until the end; see references/measurement.md.
+./scripts/sightglass -m cycles -i 30 <the same benchmarks> \
+    > $R/sightglass-data/confirm-cycles.csv
+
+# 3. Whole suite, in the background. The authority for ranking and for any
+#    suite-wide claim, but ~70 minutes on pca.suite -- nothing waits on it.
 ./scripts/sightglass > $R/sightglass-data/screen-insts-retired.csv
 ```
+
+Sightglass buffers its CSV until the end, so a long screen gives you nothing
+until it finishes — there is no partial output to poll.
 
 Then rank the benchmarks and pick the extremes:
 
@@ -219,16 +291,14 @@ and whether sightglass calls it significant, then the top-`N` each way as
 copy-pasteable `.wasm` paths for the confirmation run. Save its output into
 `$R/sightglass-data/ranking.txt`.
 
-Confirm just those benchmarks with cycles, at high sample count:
+When the full screen lands, re-rank against it and check your picks. If a
+benchmark you have not analyzed outranks the ones you have, **start its
+disassembly immediately and in the background** — that is usually the
+longest-running tool call in the whole analysis, and on one occasion the worst
+regression took ~25 minutes to disassemble and turned out to be the strongest
+evidence in the report. Run cycles on it too if it was not in the subset.
 
-```bash
-cd ~/regalloc2
-./scripts/sightglass -m cycles -i 30 \
-    benchmarks/bz2/benchmark.wasm benchmarks/regex/benchmark.wasm ... \
-    > $R/sightglass-data/confirm-cycles.csv
-```
-
-Read `references/measurement.md` before interpreting any of this. The three
+Read `references/measurement.md` before interpreting any of this. The four
 things that most often go wrong:
 
 - **Direction.** These are counts, so **lower is faster**. Check which engine is
@@ -239,23 +309,44 @@ things that most often go wrong:
   individual benchmark.
 - **Cycles may simply not resolve.** If it does not, say so plainly in the
   report — rank by `insts-retired` and record that cycles was inconclusive.
-  Do not promote a noisy cycles number to a finding.
+  Do not promote a noisy cycles number to a finding. Check robustness (median,
+  trimmed mean, minimum-to-minimum, within-engine spread) before believing one
+  that *is* significant; `references/measurement.md` has the snippet.
+- **Severity written from instruction counts.** For a register allocator the
+  difference is usually register-register moves, which `insts-retired` cannot
+  distinguish from a cache miss. One session saw -15.06% instructions become
+  -1.15% cycles, and a -2.23% "regression" become a +7.38% win. Write the
+  mechanism when you have it; write the magnitude when cycles lands.
 
 If `insts-retired` and `cycles` disagree in direction, that is informative
 rather than suspicious: it usually means moves were traded for memory traffic
-(or the reverse). Note it and look at the code.
+(or the reverse). Note it and look at the code — a direction disagreement has
+been a genuine win hiding behind a worse instruction count.
 
-## 3. Build a corpus for the whole suite
+## 3. Build a corpus
 
 Capture the allocator inputs so that replaying an allocation costs one
-allocation instead of a Wasmtime rebuild.
+allocation (a few seconds) instead of a Wasmtime run.
 
-**Build the corpus over every benchmark the suite runs, not just the top-`N` you
-are going to analyze.** The analysis subset is chosen from a noisy screen and
-will change between invocations; the corpus is a fixed, reusable workload that
-later invocations, and the optimization work in step 3, can replay without
-re-capturing. Capturing the whole suite costs one extra Wasmtime run per module
-and saves repeating this every time the picks change.
+**Build a per-module corpus for each benchmark you are going to analyze, into
+its own directory.** That is what the analysis actually needs, it costs a couple
+of minutes per small module, and it keeps provenance unambiguous:
+
+```bash
+cd ~/regalloc2
+./scripts/make-corpus -c $R/corpus-heapsort \
+    ~/sightglass/benchmarks/shootout/shootout-heapsort.wasm
+./scripts/make-corpus -c $R/corpus-keccak \
+    ~/sightglass/benchmarks/shootout/shootout-keccak.wasm
+```
+
+A whole-suite corpus is also useful — it is a fixed, reusable workload and the
+source of the suite-wide static baseline — but **treat it as an optional
+background job that may not finish.** It runs a Wasmtime compile per module,
+and on `pca.suite` one attempt reached 2 of 17 modules in 68 minutes before
+being abandoned; the per-module corpora carried the whole analysis instead. If
+you want it, start it early, do not block on it, and do not let it compete for
+CPU with the measurements that matter.
 
 Expand the suite into module paths and hand them all to `make-corpus` at once —
 one invocation, so a single Wasmtime build serves every module:
@@ -281,10 +372,15 @@ background** and get on with §4 while it works. `make-corpus` exits nonzero if
 any module captured nothing; check for that rather than assuming it finished
 cleanly.
 
-Each capture lands as `$R/corpus/<module>-<counter>[-<function>].json`. The
-module-name prefix is why one directory can hold the whole suite without
-collisions, and re-running over a module overwrites rather than accumulating
-duplicates. The input for a function you care about is found by name:
+Each capture lands as `$R/corpus/<module>-<counter>[-<function>].postcard`
+(postcard-encoded, not JSON). `<module>` is the `.wasm`'s base name, except for
+sightglass's many identically-named `benchmark.wasm` modules, where it is the
+*directory* name instead — so `blake3-scalar/benchmark.wasm` captures as
+`blake3-scalar-0000-...` and does not collide with `hashset`'s. Re-running over
+a module overwrites rather than accumulating duplicates.
+
+The input for a function you care about is found by name, when the module
+carries a name section:
 
 ```bash
 ls $R/corpus | grep -i <function-name>
@@ -296,7 +392,7 @@ allocation:
 ```bash
 cd ~/regalloc2/regicide
 RUST_LOG=trace cargo run --all-features --example run -- \
-    ../$R/corpus/bz2-benchmark-0003-some_function.json
+    ../$R/corpus/bz2-0003-some_function.postcard
 ```
 
 A whole-suite corpus also gives you a cheap aggregate: the per-function counts
@@ -320,6 +416,48 @@ For each benchmark you are writing up, profile it and work down from the hottest
 code. Cold code is not worth analyzing: a perfect fix to a block that never
 executes is worth nothing, and a block you never even sampled is worth less than
 that.
+
+### First: check the hot code is actually Wasm
+
+**Most of `pca.suite`'s execution cost is not register-allocated code at all.**
+Check this per benchmark before analyzing it, because a benchmark whose time is
+spent in Wasmtime's host runtime cannot tell you anything about either
+allocator. Measured on `pca.suite`:
+
+| benchmark | share of suite cost | where its guest time goes |
+| --- | ---: | --- |
+| `splay` | **79.8%** | ~96% inside `wasmtime_builtin_gc_alloc_raw` (host GC) |
+| `shootout-memmove` | 10.1% | ~99% inside `wasmtime_builtin_memory_copy` |
+| `cm-online-stats` | 7.9% | a *component*; `scripts/profile` cannot run it |
+
+Those three are **97.8% of the suite's instruction count**, and the screen
+confirmed the prediction: they came back at +0.00%, -0.26% and -0.37%, i.e.
+no difference, because there is nothing there for an allocator to affect.
+
+Two consequences:
+
+- **Never quote `Sum Total`.** On this suite it read -0.84% against a
+  per-benchmark geomean of -20.10% — understating the regression ~24x, because
+  it is dominated by benchmarks that cannot move. Rank and report
+  per-benchmark, treating each as one observation regardless of absolute size.
+- **If a top-`N` pick turns out to be host-bound, say so and move down the
+  list.** Producing a block analysis of Wasmtime's GC is wasted work.
+
+The check is one look at the call tree under `array_call_native`: if the
+inclusive time collapses into a `wasmtime_builtin_*` frame, the benchmark is
+host-bound.
+
+**Components cannot be profiled.** `scripts/profile` passes
+`-W unknown-imports-default` to satisfy sightglass's `bench.start`/`bench.end`
+imports, and Wasmtime rejects that flag for components:
+
+```
+cannot use `--default-values-unknown-imports` with components
+```
+
+`cm-online-stats` and `kotlin-richards` are both components. They still appear
+in the screen — sightglass runs them fine — but cannot be taken to §4/§5 by
+this route.
 
 ```bash
 cd ~/regalloc2
@@ -377,7 +515,12 @@ The full method — what to look for in a block, the "why" ladder from
 instructions down to regicide's design choices, how to count virtual cycles, and
 which log targets answer which question — is in
 `references/analyzing-allocation.md`. **Read it before analyzing your first
-block.** The report layout and a filled-in example are in
+block**, especially §"Counting, mechanically", which has the arm64 spill-counting
+trap and the per-function mix table that localizes a regression in one pass.
+
+`references/known-findings.md` has what previous runs established about
+regicide's design, so that a level-3 explanation starts from the known
+mechanisms rather than deriving them again. The report layout and a filled-in example are in
 `references/report-templates.md`.
 
 In short, each per-benchmark report contains:
@@ -423,6 +566,26 @@ never showed up in a profile. Say explicitly, for each item, how many benchmarks
 it appeared in and how hot the code was — that is what makes the list
 actionable.
 
+Three things the top line must do, learned from getting them wrong:
+
+- **Report both metrics, and name the disagreement if there is one.** "Behind on
+  12 of 17 by instruction count; on cycles most of that does not resolve and
+  regicide wins the one benchmark that does" is the truth, and the tension is
+  itself a result. A top line quoting one metric misdescribes the comparison.
+- **Give each finding a cost, and say which metric it came from.** Breadth
+  without cost is not actionable: the same mechanism was worth ~1% on one
+  benchmark and 53% on another.
+- **Say what you did *not* analyze, and where it ranked.** A report covering the
+  5th, 6th and 10th worst regressions while the top four are untouched should
+  say so prominently, not bury it. (Then go analyze the worst one — in that
+  session it turned out to share a root cause and to be the strongest evidence
+  for the whole finding.)
+
+**Revise the whole report when a late result changes it**, rather than appending
+a correction. If cycles lands after the per-benchmark write-ups, go back through
+them. A reader should not have to reconcile a stale severity claim in one file
+against a corrected one in another.
+
 Template in `references/report-templates.md`.
 
 ## Environment notes
@@ -440,38 +603,77 @@ Template in `references/report-templates.md`.
   `regicide/`, or pass `--manifest-path regicide/Cargo.toml`.
 - **`wasmtime/` is a separate checkout too**, and the scripts drive it with
   `--manifest-path wasmtime/Cargo.toml`.
-- The first build of each profile is slow, and the scripts want three different
-  ones: `release` (`sightglass`), `profiling` (`profile`), and `debug`
-  (`disassemble`, `log`, `make-corpus`, `visualize`). Budget ~2 minutes per
-  Wasmtime build once its dependencies are warm, considerably more from cold.
-- **`disassemble`, `log`, `make-corpus` and `visualize` run a *debug* Wasmtime**,
-  so the `wasmtime compile` step itself is slow — a couple of minutes for even a
-  200KB module, and proportionally worse for `sqlite3` or `spidermonkey`. This
-  is the cost that makes a whole-suite `make-corpus` a background job. Budget
-  for it rather than assuming a compile is quick.
+- **Two cargo profiles, not three.** `sightglass`, `disassemble`, `log`,
+  `make-corpus` and `visualize` all use `release`; `profile` uses `profiling`
+  (optimized plus line tables). Budget a few minutes per Wasmtime build with
+  warm dependencies, considerably more from cold. The scripts used to run a
+  *debug* Wasmtime, which made every `wasmtime compile` painfully slow; that is
+  fixed, so do not budget for it.
+- **A `wasmtime compile` is still not free**, even in release. Expect seconds
+  for a small module, minutes for `sqlite3`-class ones, and worse for a module
+  whose codegen regresses badly — `shootout-switch` took ~25 minutes to
+  disassemble under regicide, because regicide emits 5.2x the code for it. **The
+  benchmark most worth analyzing is often the one slowest to disassemble**, so
+  start that job first and in the background.
+- `samply-text` must be on `PATH` for `scripts/profile`
+  (`cargo install samply-text`); the script errors out with a hint if it is not.
 - Run every long job in the background and do the write-up of the previous step
   while it works (see "How to sequence the work").
+- **Count entries with `find ... | wc -l` or `ls -1`, not `ls | wc -l`** — `ls`
+  columnizes when its output is a pipe on this host, so `ls | wc -l` silently
+  undercounts (it reported 197 for a 393-file corpus).
 
 ## Pitfalls
 
+Ordered roughly by how much they cost when hit.
+
+- **Stating severity from `insts-retired`.** It finds mechanisms; it is a bad
+  cost estimate for a register allocator, because moves are its blind spot. One
+  session had a -15.06% "regression" that was -1.15% on cycles, and a benchmark
+  filed under `regressions/` that was a +7.38% *win*. Launch cycles early;
+  write the mechanism up immediately and the magnitude only once cycles lands.
+- **Concluding "the mechanism is cheap" from small benchmarks.** The same
+  mechanism cost ~1% at a loop exit and **53% of wall-clock time** where
+  jump-table fan-out multiplied it ~4,000 times. Say "cheap per occurrence,
+  severe where the shape multiplies it" and name which case you measured.
+- **Counting spills as `str`/`ldr` on arm64.** Spills are `stur`/`ldur` against
+  `sp`; the `str`/`ldr` columns look reassuringly equal while spill traffic has
+  doubled. Filter on `\[sp`. See `references/analyzing-allocation.md`.
 - **Writing the report at the end.** The most common way this work gets lost.
   Write continuously (see Invariants).
+- **Analyzing a host-bound benchmark.** On `pca.suite`, 97.8% of execution cost
+  is in three modules that are host-GC-bound, host-memcpy-bound, or
+  unprofilable components. Check the call tree under `array_call_native` before
+  analyzing anything (§4).
+- **Trusting `Sum Total`.** On this suite it reads -0.84% against a
+  per-benchmark geomean of -20.10% — a ~24x understatement. Per-benchmark
+  results are what the report is about.
+- **Believing a cycles result from its mean alone.** Check median, trimmed mean
+  and minimum-to-minimum, and the within-engine spread. That is what separated
+  two real results from one noise artifact in the last run.
 - **Concluding "no difference" from an underpowered run.** Three iterations of
   `cycles` resolves nothing. Either raise `-i` or report `insts-retired` and say
-  cycles was inconclusive.
-- **Trusting `Sum Total`.** It reaches significance much more easily than
-  individual benchmarks and can hide a per-benchmark regression. Per-benchmark
-  results are what the report is about.
+  cycles was inconclusive — and note a `-i 3` screen can miss a real regression
+  a `-i 5` run resolves.
+- **Benchmarking on a loaded host.** Check `uptime` first, not after a result
+  fails to resolve, and do not let your own corpus builds compete with a cycles
+  run.
 - **Analyzing cold code.** Always go through the profile first. A block with no
   samples is not a finding.
 - **Analyzing only the regressions.** Half the deliverable is knowing what to
-  preserve.
+  preserve — and a win can be invisible to the metric you are ranking by.
 - **Stopping at level 1 of the "why" ladder.** "Regicide inserted an extra move"
   is an observation. The finding is *why* it did, and what about its design made
   it do so.
+- **Proposing a fix without checking it exists.** One session's draft
+  recommended adding cross-region register hinting; `hint_across_regions` had
+  been there all along, and the real finding was one level deeper — the hints
+  are built and then *discarded*. Grep before you recommend.
 - **Reading the flat profile view.** It is dominated by sleeping threads. Use
   `-t`.
 - **Matching functions between disassemblies by index.** Match by name;
   numbering can differ.
+- **Letting a whole-suite corpus block the analysis.** It may not finish.
+  Per-module corpora for your actual targets are what the work needs (§3).
 - **Drifting into step 3.** If you find yourself editing regicide, stop. Write
   the finding down instead.

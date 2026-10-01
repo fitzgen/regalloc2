@@ -232,8 +232,8 @@ something you can actually navigate — use it when the textual log is too much.
 Anything after `--` goes to `wasmtime compile`.
 
 Works by compiling with `REGICIDE_DUMP` set, which captures each allocation's
-input as JSON under `<out>/dumps/`, then rendering each with regicide's
-`visualize` example. A single allocation that fails to render does not sink the
+input under `<out>/dumps/`, then rendering each with regicide's `visualize`
+example. A single allocation that fails to render does not sink the
 rest; its error goes to `<out>/<name>.log`.
 
 **Regicide only.** There is no equivalent for regalloc2's backtracking
@@ -255,18 +255,32 @@ iteration loop.
 | --- | --- |
 | `-c`, `--clean` | Empty the output directory first, rather than adding to it. |
 
-Captures one JSON file per allocation, named
-`<module>-<counter>[-<function>].json`. The counter is in function order
-(`parallel-compilation=n`), and the module name prefix means corpora from
-different benchmarks can share a directory. Re-running over the same module
-overwrites rather than piling up duplicates; a genuine name collision between
-two modules gets a `-2` suffix.
+Captures one **postcard-encoded** file per allocation, named
+`<module>-<counter>[-<function>].postcard`. The counter is in function order
+(`parallel-compilation=n`). `<module>` is the `.wasm`'s base name, except that
+sightglass names nearly every module `benchmark.wasm` and distinguishes them by
+*directory*, so `make-corpus` uses the directory name in that case —
+`blake3-scalar/benchmark.wasm` becomes `blake3-scalar-0000-...`. Several
+benchmarks can therefore share one directory without collision. Re-running over
+a module overwrites rather than piling up duplicates; a genuine collision still
+gets a `-2` suffix.
 
-**Pass every module in one invocation.** It builds Wasmtime once and then
-compiles each module in turn, so one call over the whole suite is far cheaper
-than one call per benchmark. Build the corpus for **every benchmark the suite
-runs**, not just the ones you are analyzing — see §3 of SKILL.md for why, and
-for the snippet that expands a `.suite` file into paths.
+**Pass every module you want in one invocation**, since it builds Wasmtime once
+and then compiles each in turn.
+
+**But prefer a per-module corpus for analysis work.** The whole-suite corpus is
+a Wasmtime compile per module and the big ones (`sqlite3`, `spidermonkey`,
+`shootout-switch`) are slow; a whole-suite run can exceed an hour and may not
+finish. A single small module takes a couple of minutes. One directory per
+module also keeps provenance unambiguous:
+
+```bash
+./scripts/make-corpus -c $R/corpus-heapsort \
+    ~/sightglass/benchmarks/shootout/shootout-heapsort.wasm
+```
+
+Build the whole-suite corpus only if you actually want the suite-wide static
+baseline, and treat it as a background job that may not land.
 
 It exits nonzero if any module captured nothing, which usually means a cache hit
 — the script passes `-C cache=n`, so this should not happen, but check for it.
@@ -277,14 +291,29 @@ Find the input for a function by name:
 ls $R/corpus | grep -i <function-name>
 ```
 
+**This only works for modules with a name section.** Most sightglass benchmarks
+are stripped, so captures come out as `benchmark-0004-u0-3.postcard` — `u0-3`
+is Wasmtime's placeholder for module 0, function 3, not a symbol. For those,
+match by function *index* against the disassembly, or identify the function you
+want by its counts (the hot function is usually the one with by far the most
+moves or spills):
+
+```bash
+cargo run --manifest-path regicide/Cargo.toml --all-features --example run \
+    -q -- -q $R/corpus-heapsort | grep -B1 -E "moves [0-9]{3,}"
+```
+
 ### Replaying with `run.rs`
 
 ```
 cargo run --manifest-path regicide/Cargo.toml --all-features --example run -- [OPTIONS] <path>...
 ```
 
-A path is either a directory (every `*.json` directly in it, sorted, so two runs
-over one corpus can be diffed) or a single input file.
+A path is either a directory (every `*.postcard` and `*.json` directly in it,
+sorted, so two runs over one corpus can be diffed) or a single input file. The
+encoding is detected from the file's contents rather than its name, so a corpus
+captured before `make-corpus` wrote postcard -- such as
+`reports/codegen-analysis-001/corpus-keccak/` -- still replays unchanged.
 
 | Flag | Notes |
 | --- | --- |
@@ -318,7 +347,7 @@ regalloc2's inputs from a Wasmtime compile, so you cannot replay the same
 function through the backtracking allocator this way. `regalloc2-tool` does run
 `ion`, `fastalloc` and `regicide` over one function, but it reads a
 **bincode-encoded `SerializableFunction`**, a different format from regicide's
-JSON captures, and nothing in `scripts/` produces it from a Wasm compile.
+captures, and nothing in `scripts/` produces it from a Wasm compile.
 
 So: use `run.rs` counts for regicide's own absolute numbers and for diffing
 regicide against regicide; use the **disassembly** for anything that compares
@@ -334,7 +363,7 @@ information `scripts/log` gives you, without compiling any Wasm:
 ```bash
 cd ~/regalloc2/regicide
 RUST_LOG=trace cargo run --all-features --example run -- \
-    ../reports/codegen-analysis-001/corpus/bz2-benchmark-0003-foo.json
+    ../reports/codegen-analysis-001/corpus/bz2-0003-foo.postcard
 ```
 
 Narrow it the same way as `WASMTIME_LOG`, e.g.
