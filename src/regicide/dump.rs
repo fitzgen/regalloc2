@@ -3,12 +3,18 @@
 //! Debugging a regicide allocation inside a large program means iterating on
 //! one function, and rebuilding that program for every attempt is far slower
 //! than replaying the allocation on its own. This module writes the exact
-//! `regicide::Input` an allocation ran on, as JSON, for
-//! `regicide::deserialize` to read back:
+//! `regicide::Input` an allocation ran on, in `postcard`'s binary encoding,
+//! for `regicide::deserialize` to read back:
 //!
 //! ```text
 //! cargo run --example visualize --all-features -- --input FILE out.html
 //! ```
+//!
+//! Binary rather than JSON because a capture is written for every function a
+//! program compiles, and a whole corpus of them is what gets replayed:
+//! `postcard` is both smaller on disk and quicker to write than JSON, and
+//! regicide's examples detect either encoding, so an older JSON corpus still
+//! replays.
 //!
 //! Enabled by the `regicide-dump` cargo feature, and then only when
 //! `REGICIDE_DUMP` names a directory to write to. Unset, nothing is captured
@@ -25,11 +31,11 @@
 //!
 //! # Naming
 //!
-//! A dump is named `<pid>-<counter>[-<function>].json`, where the counter runs
-//! from zero within one process and the function's name is absent if it has
-//! none. Both the process id and the counter are load-bearing: a test suite
-//! runs many processes at once, each with its own counter starting at zero,
-//! and each allocates many functions.
+//! A dump is named `<pid>-<counter>[-<function>].postcard`, where the counter
+//! runs from zero within one process and the function's name is absent if it
+//! has none. Both the process id and the counter are load-bearing: a test
+//! suite runs many processes at once, each with its own counter starting at
+//! zero, and each allocates many functions.
 
 use crate::Function;
 use alloc::{
@@ -90,13 +96,14 @@ pub(crate) fn maybe_dump<F: Function>(input: &rgc::Input<'_, impl rgc::InputFunc
     }
 }
 
-/// Serialize `input` to `path` as JSON.
+/// Serialize `input` to `path`, in `postcard`'s binary encoding.
 fn write(input: &rgc::Input<'_, impl rgc::InputFunction>, path: &Path) -> Result<(), String> {
     let file = File::create(path).map_err(|e| e.to_string())?;
-    serde_json::to_writer(
-        BufWriter::new(file),
+    postcard::to_io(
         &rgc::serialize::SerializeInput::new(input),
+        BufWriter::new(file),
     )
+    .map(|_| ())
     .map_err(|e| e.to_string())
 }
 
@@ -112,7 +119,7 @@ fn file_name(counter: u64, func: Option<&str>) -> String {
         name.push('-');
         name.push_str(func);
     }
-    name.push_str(".json");
+    name.push_str(".postcard");
     name
 }
 
@@ -175,7 +182,7 @@ mod tests {
     #[test]
     fn names() {
         let pid = process::id();
-        assert_eq!(file_name(7, Some("u3-0")), format!("{pid}-0007-u3-0.json"));
-        assert_eq!(file_name(7, None), format!("{pid}-0007.json"));
+        assert_eq!(file_name(7, Some("u3-0")), format!("{pid}-0007-u3-0.postcard"));
+        assert_eq!(file_name(7, None), format!("{pid}-0007.postcard"));
     }
 }

@@ -28,8 +28,8 @@ serde = { version = "1.0.136", features = [
 ], default-features = false, optional = true }
 
 # Only needed by the `regicide-dump` feature, to encode a captured allocator
-# input as JSON.
-serde_json = { version = "1.0.80", optional = true, default-features = false, features = ["std"] }
+# input in postcard's binary format.
+postcard = { version = "1.1.3", optional = true, default-features = false, features = ["use-std"] }
 
 # The below are only needed for fuzzing.
 arbitrary = { version = "1.4.2", optional = true }
@@ -66,10 +66,18 @@ trace-log = ["regicide?/trace-log"]
 # Enables the `regicide` register allocator as `Algorithm::Regicide`.
 regicide = ["dep:regicide"]
 
-# Enables capturing the input to `Algorithm::Regicide` as JSON, for replaying it
-# outside the program that produced it. Does nothing unless `REGICIDE_DUMP`
-# names a directory to write to; see the `regicide::dump` module.
-regicide-dump = ["regicide", "regicide?/serialize", "dep:serde_json", "std"]
+# Enables capturing the input to `Algorithm::Regicide`, for replaying it outside
+# the program that produced it. Does nothing unless `REGICIDE_DUMP` names a
+# directory to write to; see the `regicide::dump` module.
+# `deserialize` so that a capture can be read back by the build that wrote it,
+# which is what the `regicide_dump*` tests check.
+regicide-dump = [
+    "regicide",
+    "regicide?/serialize",
+    "regicide?/deserialize",
+    "dep:postcard",
+    "std",
+]
 
 # Exposes the internal API for fuzzing.
 fuzzing = ["arbitrary", "arbtest", "checker", "trace-log", "regicide"]

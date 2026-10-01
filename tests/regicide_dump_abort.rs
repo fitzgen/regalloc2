@@ -15,7 +15,7 @@ use regalloc2::{
     Algorithm, Block, Function, Inst, InstRange, MachineEnv, Operand, OperandConstraint,
     OperandKind, OperandPos, PReg, PRegSet, RegClass, RegallocOptions, VReg,
 };
-use regicide::BlockFrequency;
+use regicide::{BlockFrequency, InputFunction, deserialize::DeserializedInput};
 use std::{
     env, fs,
     process::{self, Command},
@@ -199,18 +199,19 @@ fn an_allocation_that_never_returns_is_still_captured() {
 
     let name = &dumps[0];
     assert!(
-        name.ends_with("-aborts.json"),
+        name.ends_with("-aborts.postcard"),
         "a dump is named the same however its allocation turns out, got {}",
         name
     );
 
     // Complete despite the abort, and so replayable: this is the whole point
     // of capturing before the run rather than after it.
-    let json = fs::read_to_string(dir.join(name)).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&json).expect("the dump should be JSON");
+    let bytes = fs::read(dir.join(name)).unwrap();
+    let input: DeserializedInput =
+        postcard::from_bytes(&bytes).expect("the dump should be a postcard-encoded input");
     assert!(
-        value.get("machine").is_some() && value.get("func").is_some(),
-        "the dump should hold both the machine and the function"
+        input.func().len_blocks() == 2 && input.machine().regs().len() > 0,
+        "the dump should hold both the machine and the whole function"
     );
 
     fs::remove_dir_all(&dir).unwrap();

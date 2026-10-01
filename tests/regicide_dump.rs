@@ -17,6 +17,7 @@ use regalloc2::{
     Algorithm, Block, Function, Inst, InstRange, MachineEnv, Operand, OperandConstraint,
     OperandKind, OperandPos, PReg, PRegSet, RegClass, RegallocOptions, VReg,
 };
+use regicide::{InputFunction, deserialize::DeserializedInput};
 use std::{env, fs, path::Path};
 
 /// The registers the machine grants.
@@ -165,7 +166,8 @@ fn dumps(dir: &Path) -> Vec<String> {
 }
 
 /// Every allocation is captured, whether it succeeds or fails, under a name
-/// carrying the function's name and a counter, and what is written is JSON.
+/// carrying the function's name and a counter, and what is written is a
+/// postcard-encoded input.
 #[test]
 fn every_allocation_is_captured() {
     let dir = env::temp_dir().join(format!("regalloc2-dump-{}", std::process::id()));
@@ -182,21 +184,33 @@ fn every_allocation_is_captured() {
     assert_eq!(
         dumps(&dir),
         vec![
-            format!("{pid}-0000-fits.json"),
-            format!("{pid}-0001-u3-0.json"),
-            format!("{pid}-0002.json"),
+            format!("{pid}-0000-fits.postcard"),
+            format!("{pid}-0001-u3-0.postcard"),
+            format!("{pid}-0002.postcard"),
         ],
         "a failing allocation is captured the same way as a successful one, \
          and the counter distinguishes them"
     );
 
-    for name in dumps(&dir) {
-        let json = fs::read_to_string(dir.join(&name)).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&json).expect("the dump should be JSON");
+    // Deserializing is the assertion worth making about the bytes: postcard is
+    // not self-describing, so there are no field names to look for, and a
+    // capture is only any use if regicide can read it back. The instruction
+    // count tells the three apart, so it also says each capture holds the
+    // function that was allocated and not another one's.
+    let live = [REGS - 1, REGS * 2, REGS - 1];
+    for (name, live) in dumps(&dir).iter().zip(live) {
+        let bytes = fs::read(dir.join(name)).unwrap();
+        let input: DeserializedInput =
+            postcard::from_bytes(&bytes).expect("the dump should be a postcard-encoded input");
         assert!(
-            value.get("machine").is_some() && value.get("func").is_some(),
-            "{} should hold both the machine and the function",
+            input.machine().regs().len() > 0,
+            "{} should hold the machine that was allocated against",
+            name
+        );
+        assert_eq!(
+            input.func().len_insts(),
+            Straightline::new(None, live).num_insts(),
+            "{} should hold the function that was allocated",
             name
         );
     }
