@@ -49,8 +49,10 @@ export WASMTIME_LOG="${WASMTIME_LOG:-cranelift_codegen::machinst::compile=trace,
 
 # The output is thrown away: this compiles for the log, not for the artifact.
 # `cache=n` because a cache hit would log nothing, and
-# `parallel-compilation=n` to keep each function's records together.
-exec cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" \
+# `parallel-compilation=n` to keep each function's records together. A release
+# build because the log is the same either way and a debug Cranelift is much
+# slower to produce it.
+exec cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" --release \
     --features trace-log \
     -- compile \
     -C cache=n \

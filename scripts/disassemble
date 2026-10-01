@@ -49,13 +49,13 @@ done
 # disassembly can be diffed against a rebuild of the same module.
 cwasm="${wasm%.*}.cwasm"
 
-cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" \
+cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" --release \
     -- compile \
     ${compile_args[@]+"${compile_args[@]}"} \
     -o "$cwasm" \
     "$wasm" >&2
 
-exec cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" \
+exec cargo run --manifest-path "$REPO/wasmtime/Cargo.toml" --release \
     -- objdump \
     ${objdump_args[@]+"${objdump_args[@]}"} \
     "$cwasm"

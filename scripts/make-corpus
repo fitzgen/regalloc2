@@ -16,7 +16,8 @@ usage() {
 usage: make-corpus [OPTIONS] path/to/out path/to/wasm...
 
 Compile each Wasm module with regicide and collect the register allocation
-inputs it captures into the output directory, one JSON file per allocation.
+inputs it captures into the output directory, one postcard-encoded file per
+allocation.
 
   path/to/out    directory to write the corpus into, created if absent and
                  added to if it already holds a corpus
@@ -65,20 +66,44 @@ done
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 
+# A release build, because building a corpus means compiling every module in a
+# suite and a debug Cranelift is slow enough to dominate that.
 echo "building wasmtime with regicide-dump..." >&2
-cargo build --manifest-path "$REPO/wasmtime/Cargo.toml" --features regicide-dump >&2
-wasmtime="$REPO/wasmtime/target/debug/wasmtime"
+cargo build --manifest-path "$REPO/wasmtime/Cargo.toml" --release --features regicide-dump >&2
+wasmtime="$REPO/wasmtime/target/release/wasmtime"
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 
-# Reduce a module's path to the `<module>` part of a capture's name. Only the
-# base name: two corpora built from different checkouts of the same benchmark
-# should agree, and a full path does not fit in a file name anyway.
-slug() {
-    basename "$1" \
+# Reduce one path component to lowercase words joined by dashes, with any
+# module extension dropped.
+normalize() {
+    printf '%s' "$1" \
         | tr '[:upper:]' '[:lower:]' \
         | sed -E 's/\.(wasm|wat|cwasm)$//; s/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+# Reduce a module's path to the `<module>` part of a capture's name.
+#
+# Normally that is the base name, and not the whole path: two corpora built
+# from different checkouts of the same benchmark should agree, and a path does
+# not fit in a file name anyway. But sightglass calls every module
+# `benchmark.wasm` and names the *directory* after the benchmark, so a base
+# name of `benchmark` says nothing and the directory is what tells
+# `blake3-scalar/benchmark.wasm` from `hashset/benchmark.wasm`.
+slug() {
+    local module
+    module="$(normalize "$(basename "$1")")"
+
+    if [[ "$module" == benchmark ]]; then
+        local dir
+        dir="$(normalize "$(basename "$(dirname "$1")")")"
+        # An unusable directory -- `benchmark.wasm` named relative to the cwd,
+        # say -- leaves the base name, which is still better than nothing.
+        [[ -n "$dir" ]] && module="$dir"
+    fi
+
+    printf '%s' "$module"
 }
 
 total=0
@@ -108,7 +133,7 @@ for wasm in "${wasms[@]}"; do
         "$wasm" >&2
 
     shopt -s nullglob
-    captures=("$dumps"/*.json)
+    captures=("$dumps"/*.postcard)
     shopt -u nullglob
 
     if [[ ${#captures[@]} -eq 0 ]]; then
@@ -123,16 +148,17 @@ for wasm in "${wasms[@]}"; do
         # nothing once the module name is in the name, and dropping it makes
         # rebuilding the corpus overwrite the old names rather than pile new
         # ones beside them.
-        rest="$(basename "$capture" .json | sed -E 's/^[0-9]+-//')"
+        rest="$(basename "$capture" .postcard | sed -E 's/^[0-9]+-//')"
         name="$module-$rest"
 
-        # Two modules can share a base name, so a name already taken gets a
-        # suffix rather than clobbering what is there.
-        dest="$out/$name.json"
+        # Two modules can still share a name -- two checkouts of the same
+        # benchmark, say -- so a name already taken gets a suffix rather than
+        # clobbering what is there.
+        dest="$out/$name.postcard"
         if [[ -e "$dest" ]]; then
             dup=2
-            while [[ -e "$out/$name-$dup.json" ]]; do dup=$((dup + 1)); done
-            dest="$out/$name-$dup.json"
+            while [[ -e "$out/$name-$dup.postcard" ]]; do dup=$((dup + 1)); done
+            dest="$out/$name-$dup.postcard"
         fi
 
         mv "$capture" "$dest"

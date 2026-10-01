@@ -3,7 +3,7 @@
 # Visualize regicide's register allocations for a Wasm module's compilation.
 #
 # Compiles the module with `REGICIDE_DUMP` set, which captures the input to
-# every regicide allocation as JSON, then renders each capture with regicide's
+# every regicide allocation, then renders each capture with regicide's
 # `visualize` example.
 
 set -euo pipefail
@@ -63,10 +63,11 @@ mkdir -p "$dumps"
 
 # `cache=n` because a cache hit would skip compilation altogether and capture
 # nothing, and `parallel-compilation=n` to keep the dump counter in the order
-# the functions appear.
+# the functions appear. A release build because the captures are the same
+# either way and a debug Cranelift is much slower to produce them.
 echo "compiling $wasm..." >&2
 REGICIDE_DUMP="$dumps" cargo run \
-    --manifest-path "$REPO/wasmtime/Cargo.toml" \
+    --manifest-path "$REPO/wasmtime/Cargo.toml" --release \
     --features regicide-dump \
     -- compile \
     -O regalloc-algorithm=regicide \
@@ -77,7 +78,7 @@ REGICIDE_DUMP="$dumps" cargo run \
     "$wasm" >&2
 
 shopt -s nullglob
-captures=("$dumps"/*.json)
+captures=("$dumps"/*.postcard)
 shopt -u nullglob
 
 if [[ ${#captures[@]} -eq 0 ]]; then
@@ -86,16 +87,16 @@ if [[ ${#captures[@]} -eq 0 ]]; then
 fi
 
 echo "building regicide's visualize example..." >&2
-cargo build --manifest-path "$REPO/regicide/Cargo.toml" \
+cargo build --manifest-path "$REPO/regicide/Cargo.toml" --release \
     --example visualize \
     --features visualizer,test-utils,deserialize >&2
-visualize="$REPO/regicide/target/debug/examples/visualize"
+visualize="$REPO/regicide/target/release/examples/visualize"
 
 rendered=0
 skipped=0
 failed=0
 for capture in "${captures[@]}"; do
-    name="$(basename "$capture" .json)"
+    name="$(basename "$capture" .postcard)"
 
     # A capture's name is `<pid>-<counter>[-<function>]`, so the function is
     # what follows the counter; a function with no name leaves nothing to match.
