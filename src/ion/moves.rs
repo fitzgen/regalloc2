@@ -1000,6 +1000,10 @@ impl<'a, F: Function> Env<'a, F> {
                     &Edit::Move { from, to } => {
                         self.annotate(pos_prio.pos, format!("move {} -> {}", from, to));
                     }
+                    // ion never rematerializes; only regicide emits this.
+                    &Edit::Remat { vreg, to } => {
+                        self.annotate(pos_prio.pos, format!("remat {} -> {}", vreg, to));
+                    }
                 }
             }
         }

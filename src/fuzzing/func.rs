@@ -3,6 +3,8 @@
  * exception. See `LICENSE` for details.
  */
 
+#[cfg(feature = "regicide")]
+use crate::RematCost;
 use crate::{
     domtree, postorder, Allocation, Block, Function, Inst, InstRange, MachineEnv, Operand,
     OperandConstraint, OperandKind, OperandPos, PReg, PRegSet, RegClass, VReg,
@@ -56,6 +58,8 @@ pub struct Func {
     block_params_out: Vec<Vec<Vec<VReg>>>,
     num_vregs: usize,
     reftype_vregs: Vec<VReg>,
+    /// Vregs called rematerializable, and what they cost; see `Options::remat`.
+    remat_vregs: Vec<(VReg, RematCost)>,
     debug_value_labels: Vec<(VReg, Inst, Inst, u32)>,
 }
 
@@ -121,6 +125,14 @@ impl Function for Func {
         self.num_vregs
     }
 
+    #[cfg(feature = "regicide")]
+    fn is_rematerializable(&self, vreg: VReg) -> Option<crate::RematCost> {
+        self.remat_vregs
+            .iter()
+            .find(|(v, _)| *v == vreg)
+            .map(|(_, cost)| *cost)
+    }
+
     fn spillslot_size(&self, regclass: RegClass) -> usize {
         match regclass {
             // Test the case where 2 classes share the same
@@ -152,6 +164,7 @@ impl FuncBuilder {
                 blocks: vec![],
                 num_vregs: 0,
                 reftype_vregs: vec![],
+                remat_vregs: vec![],
                 debug_value_labels: vec![],
             },
             insts_per_block: vec![],
@@ -369,6 +382,7 @@ pub struct Options {
     pub fixed_nonallocatable: bool,
     pub clobbers: bool,
     pub reftypes: bool,
+    pub remat: bool,
     pub callsite_ish_constraints: bool,
     pub num_blocks: RangeInclusive<usize>,
     pub num_vregs_per_block: RangeInclusive<usize>,
@@ -393,6 +407,7 @@ impl Options {
         fixed_nonallocatable: false,
         clobbers: false,
         reftypes: false,
+        remat: false,
         callsite_ish_constraints: false,
         num_blocks: 1..=100,
         num_vregs_per_block: 5..=15,
@@ -596,6 +611,31 @@ impl Func {
                         63,
                         RegClass::arbitrary(u)?,
                     )));
+                }
+
+                // Only a def of an instruction that reads nothing qualifies,
+                // since a remat re-executes it where its inputs are
+                // unavailable. Decided after the operand conversions above, so
+                // it sees the operand list the allocator will.
+                let num_defs = operands
+                    .iter()
+                    .filter(|op| op.kind() == OperandKind::Def)
+                    .count();
+                if opts.remat
+                    && num_defs == 1
+                    && !operands.iter().any(|op| op.kind() == OperandKind::Use)
+                    && bool::arbitrary(u)?
+                {
+                    let cost = *u.choose(&[
+                        RematCost::AlwaysRemat,
+                        RematCost::CheaperThanMove,
+                        RematCost::CheaperThanReload,
+                    ])?;
+                    for op in &operands {
+                        if op.kind() == OperandKind::Def {
+                            builder.f.remat_vregs.push((op.vreg(), cost));
+                        }
+                    }
                 }
 
                 builder.add_inst(

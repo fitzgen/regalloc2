@@ -22,6 +22,7 @@ const OPTIONS: func::Options = func::Options {
     fixed_nonallocatable: true,
     clobbers: true,
     reftypes: true,
+    remat: true,
     callsite_ish_constraints: true,
     fixed_reg_max: 31,
     ..func::Options::DEFAULT

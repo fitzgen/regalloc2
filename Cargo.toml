@@ -80,7 +80,18 @@ regicide-dump = [
 ]
 
 # Exposes the internal API for fuzzing.
-fuzzing = ["arbitrary", "arbtest", "checker", "trace-log", "regicide"]
+#
+# `regicide/checker` localizes a fuzz failure: running regicide's own checker
+# over the same allocation says whether a disagreement is regicide's or this
+# crate's translation of it.
+fuzzing = [
+    "arbitrary",
+    "arbtest",
+    "checker",
+    "trace-log",
+    "regicide",
+    "regicide?/checker",
+]
 
 # Enables serde for exposed types.
 enable-serde = ["serde"]

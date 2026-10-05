@@ -447,6 +447,19 @@ struct Prepass {
     /// Its length is the function's value count.
     val_class: Vec<rgc::RegClass>,
 
+    /// The vreg each `Val` stands for, the inverse of `vreg_to_val`.
+    ///
+    /// Needed because regicide names a rematerialized value by `Val` while
+    /// `Edit::Remat` names a vreg. Every `Val` here stands for a vreg, since a
+    /// clobber becomes a register in a `RegSet` rather than a value.
+    val_to_vreg: Vec<VReg>,
+
+    /// What each `Val` costs to recompute, or `None` when it cannot be.
+    ///
+    /// Held here rather than asked on demand because `AdaptorValue` is
+    /// deliberately not generic over the `Function`.
+    val_remat: Vec<Option<rgc::RematCost>>,
+
     /// Every instruction's operands, back to back.
     operands: Vec<rgc::Operand>,
 
@@ -463,20 +476,30 @@ struct Prepass {
     reuse_targets: Vec<u32>,
 }
 
+/// Everything `define_val` writes, bundled to keep its signature short.
+struct ValTables<'a> {
+    vreg_to_val: &'a mut [u32],
+    val_class: &'a mut Vec<rgc::RegClass>,
+    val_to_vreg: &'a mut Vec<VReg>,
+    val_remat: &'a mut Vec<Option<rgc::RematCost>>,
+}
+
 /// Note the definition of `vreg`, giving it the next `Val`.
+///
+/// `remat` is what recomputing it costs; see `remat_cost_of_def`.
 fn define_val(
-    vreg_to_val: &mut [u32],
-    val_class: &mut Vec<rgc::RegClass>,
+    tables: &mut ValTables<'_>,
     machine: &MachineCache,
     multiple_defs_allowed: bool,
     vreg: VReg,
     inst: Inst,
+    remat: Option<rgc::RematCost>,
 ) -> Result<(), RegAllocError> {
     let index = vreg.vreg();
-    if index >= vreg_to_val.len() {
+    if index >= tables.vreg_to_val.len() {
         return Err(RegAllocError::SSA(vreg, inst));
     }
-    if vreg_to_val[index] != u32::MAX {
+    if tables.vreg_to_val[index] != u32::MAX {
         return Err(if multiple_defs_allowed {
             RegAllocError::RegicideUnsupported(String::from(
                 "regicide requires every value to be defined exactly once, so \
@@ -488,9 +511,39 @@ fn define_val(
         });
     }
     let class = machine.base(vreg.class())?;
-    vreg_to_val[index] = u32::try_from(val_class.len()).expect("a Val index fits in a u32");
-    val_class.push(class);
+    let val = u32::try_from(tables.val_class.len()).expect("a Val index fits in a u32");
+    tables.vreg_to_val[index] = val;
+    tables.val_class.push(class);
+    tables.val_to_vreg.push(vreg);
+    tables.val_remat.push(remat);
+    debug_assert_eq!(tables.val_class.len(), tables.val_to_vreg.len());
+    debug_assert_eq!(tables.val_class.len(), tables.val_remat.len());
     Ok(())
+}
+
+/// What recomputing `vreg` costs, or `None` when nothing could stand in for
+/// this definition.
+///
+/// Only an instruction that reads nothing qualifies, since a remat re-executes
+/// it where its inputs are unavailable. The shim checks this rather than
+/// trusting the client, because regicide validates it and a violation fails
+/// the whole allocation. Its other two rules hold here by construction.
+fn remat_cost_of_def<F: Function>(
+    func: &F,
+    vreg: VReg,
+    reads_nothing: bool,
+) -> Option<rgc::RematCost> {
+    let cost = func.is_rematerializable(vreg);
+    debug_assert!(
+        cost.is_none() || reads_nothing,
+        "a `Function` called a vreg rematerializable whose definition reads \
+         other values, which regicide rejects outright; ignoring it",
+    );
+    if reads_nothing {
+        cost
+    } else {
+        None
+    }
 }
 
 /// The `Val` standing for `vreg`, or an error if nothing defines it.
@@ -698,13 +751,19 @@ fn build_prepass<F: Function>(
     let Prepass {
         vreg_to_val,
         val_class,
+        val_to_vreg,
+        val_remat,
         operands,
         clobbers,
         insts,
         reuse_targets,
     } = prepass;
-    let vreg_to_val = vreg_to_val.repopulate(func.num_vregs(), u32::MAX);
-    let val_class = val_class.cleared();
+    let mut tables = ValTables {
+        vreg_to_val: vreg_to_val.repopulate(func.num_vregs(), u32::MAX),
+        val_class: val_class.cleared(),
+        val_to_vreg: val_to_vreg.cleared(),
+        val_remat: val_remat.cleared(),
+    };
     let operands = operands.cleared();
     let clobbers = clobbers.cleared();
     let insts = insts.repopulate(
@@ -737,28 +796,38 @@ fn build_prepass<F: Function>(
         }
 
         for &vreg in func.block_params(block) {
+            // No instruction defines a block parameter, so there is nothing
+            // to re-execute.
             define_val(
-                vreg_to_val,
-                val_class,
+                &mut tables,
                 machine,
                 multiple_defs_allowed,
                 vreg,
                 Inst::invalid(),
+                None,
             )?;
         }
         for inst in range.iter() {
+            // regicide asks this of the operands after translation, where a
+            // `fixed_nonallocatable` operand is a `Use`, so it counts here
+            // too.
+            let reads_nothing = !func
+                .inst_operands(inst)
+                .iter()
+                .any(|op| op.kind() == OperandKind::Use);
             for op in func.inst_operands(inst) {
                 if op.as_fixed_nonallocatable().is_some() {
                     continue;
                 }
                 if op.kind() == OperandKind::Def {
+                    let remat = remat_cost_of_def(func, op.vreg(), reads_nothing);
                     define_val(
-                        vreg_to_val,
-                        val_class,
+                        &mut tables,
                         machine,
                         multiple_defs_allowed,
                         op.vreg(),
                         inst,
+                        remat,
                     )?;
                 }
             }
@@ -889,11 +958,13 @@ impl<'a> AdaptorInst<'a> {
 struct AdaptorValue {
     val: rgc::Val,
     class: rgc::RegClass,
+    remat_cost: Option<rgc::RematCost>,
 }
 
 /// Iterates over an [`Adaptor`]'s values.
 struct AdaptorValuesIter<'a> {
     classes: iter::Enumerate<slice::Iter<'a, rgc::RegClass>>,
+    remat: &'a [Option<rgc::RematCost>],
 }
 
 /// Iterates over an [`Adaptor`]'s blocks.
@@ -930,7 +1001,14 @@ impl Iterator for AdaptorValuesIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let (index, &class) = self.classes.next()?;
         let val = rgc::Val::try_new(index).expect("Vals are numbered densely from zero");
-        Some((val, AdaptorValue { val, class }))
+        Some((
+            val,
+            AdaptorValue {
+                val,
+                class,
+                remat_cost: self.remat[index],
+            },
+        ))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1051,6 +1129,7 @@ impl<F: Function> rgc::InputFunction for Adaptor<'_, F> {
     fn values(&self) -> Self::ValuesIter<'_> {
         AdaptorValuesIter {
             classes: self.prepass.val_class.iter().enumerate(),
+            remat: &self.prepass.val_remat,
         }
     }
 
@@ -1058,6 +1137,7 @@ impl<F: Function> rgc::InputFunction for Adaptor<'_, F> {
         AdaptorValue {
             val,
             class: self.prepass.val_class[val.index()],
+            remat_cost: self.prepass.val_remat[val.index()],
         }
     }
 
@@ -1110,10 +1190,7 @@ impl rgc::InputValue<'_> for AdaptorValue {
     }
 
     fn remat_cost(&self) -> Option<rgc::RematCost> {
-        // regalloc2's interface says nothing about rematerialization, so
-        // nothing here can ever be rematerialized. This is also what makes
-        // `Edit::Remat` unreachable, and so translatable-or-bug.
-        None
+        self.remat_cost
     }
 
     fn reg_class(&self) -> rgc::RegClass {
@@ -1310,15 +1387,29 @@ fn translate_alloc(
 /// Translate one of regicide's edits.
 fn translate_edit(
     machine: &MachineCache,
+    prepass: &Prepass,
     spillslot_map: &[u32],
     edit: rgc::Edit,
 ) -> Result<Edit, RegAllocError> {
-    // `Edit::Remat` cannot happen, because nothing this shim describes is
-    // rematerializable; `Edit::CriticalEdge` cannot happen, because
-    // `CFGInfo::init` has already rejected every function with a critical edge
-    // regicide would want to split.
+    let reg = |reg: rgc::Reg| Allocation::reg(machine.preg_of_reg[reg.index()]);
+    let slot =
+        |slot: rgc::SpillSlot| Allocation::stack(SpillSlot::new(spillslot_map[slot.index()] as _));
+
+    // `Edit::CriticalEdge` cannot happen, because `CFGInfo::init` has already
+    // rejected every function with a critical edge regicide would want to
+    // split.
     let mv = match edit {
         rgc::Edit::Move(mv) => mv,
+        rgc::Edit::Remat(rgc::Remat { val, dest }) => {
+            // This names the vreg whose defining instruction the client
+            // re-executes, so atop a block it stays the predecessor's
+            // argument rather than the parameter it delivers: a parameter has
+            // no definition to re-run. The checker handles that renaming.
+            return Ok(Edit::Remat {
+                vreg: prepass.val_to_vreg[val.index()],
+                to: reg(dest),
+            });
+        }
         edit => {
             return Err(shim_error(format!(
                 "regicide emitted {:?}, which this crate's `Edit` cannot express",
@@ -1326,10 +1417,6 @@ fn translate_edit(
             )))
         }
     };
-
-    let reg = |reg: rgc::Reg| Allocation::reg(machine.preg_of_reg[reg.index()]);
-    let slot =
-        |slot: rgc::SpillSlot| Allocation::stack(SpillSlot::new(spillslot_map[slot.index()] as _));
 
     Ok(match mv {
         rgc::Move::RegReg { from, to } => Edit::Move {
@@ -1434,7 +1521,7 @@ fn translate_output<F: Function>(
                     }
                 }
                 rgc::InstOrEdit::Edit(edit) => {
-                    let edit = translate_edit(machine, spillslot_map, edit)?;
+                    let edit = translate_edit(machine, adaptor.prepass, spillslot_map, edit)?;
                     output.edits.push((ProgPoint::before(Inst::new(0)), edit));
                     pending += 1;
                 }
@@ -1565,6 +1652,7 @@ mod tests {
         /// Each class's spill-slot size; `None` for a class that panics when
         /// asked.
         spillslot_size: [Option<usize>; NUM_CLASSES],
+        remat: Vec<VReg>,
     }
 
     impl Probe {
@@ -1581,6 +1669,7 @@ mod tests {
                 clobbers: PRegSet::empty(),
                 clobbers_at: None,
                 spillslot_size: [Some(1); NUM_CLASSES],
+                remat: vec![],
             }
         }
 
@@ -1594,6 +1683,11 @@ mod tests {
         fn clobbering_only_at(mut self, inst: usize, pregs: PRegSet) -> Self {
             self.clobbers = pregs;
             self.clobbers_at = Some(inst);
+            self
+        }
+
+        fn rematerializable(mut self, vregs: &[VReg]) -> Self {
+            self.remat.extend_from_slice(vregs);
             self
         }
 
@@ -1648,10 +1742,128 @@ mod tests {
         fn num_vregs(&self) -> usize {
             self.num_vregs
         }
+        fn is_rematerializable(&self, vreg: VReg) -> Option<rgc::RematCost> {
+            self.remat
+                .contains(&vreg)
+                .then_some(rgc::RematCost::AlwaysRemat)
+        }
         fn spillslot_size(&self, class: RegClass) -> usize {
             self.spillslot_size[class as usize].unwrap_or_else(|| {
                 panic!("this target has no spill-slot size for {:?} to give", class)
             })
+        }
+    }
+
+    /// A function of several blocks, for the tests that need more than one.
+    ///
+    /// block0 falls to every other block, each of which returns, so there is
+    /// no critical edge and no block parameter: values flow by dominance.
+    struct Branching {
+        /// Each block's instructions, as operand lists. The empty last one in
+        /// each block is its terminator.
+        blocks: Vec<Vec<Vec<Operand>>>,
+        /// Which blocks are cold.
+        cold: Vec<usize>,
+        num_vregs: usize,
+        /// Held rather than built on demand because the trait hands out
+        /// borrows that outlive the call.
+        succs_of_entry: Vec<Block>,
+        entry_only: Vec<Block>,
+    }
+
+    impl Branching {
+        fn new(blocks: Vec<Vec<Vec<Operand>>>, cold: Vec<usize>, num_vregs: usize) -> Self {
+            let succs_of_entry = (1..blocks.len()).map(Block::new).collect();
+            Branching {
+                blocks,
+                cold,
+                num_vregs,
+                succs_of_entry,
+                entry_only: vec![Block::new(0)],
+            }
+        }
+
+        /// The index of `block`'s first instruction.
+        fn first_inst_of(&self, block: usize) -> usize {
+            self.blocks[..block].iter().map(|b| b.len()).sum()
+        }
+
+        fn inst_at(&self, inst: usize) -> (usize, usize) {
+            let mut start = 0;
+            for (b, insts) in self.blocks.iter().enumerate() {
+                if inst < start + insts.len() {
+                    return (b, inst - start);
+                }
+                start += insts.len();
+            }
+            panic!("inst{} is past the end of the function", inst)
+        }
+    }
+
+    impl Function for Branching {
+        fn num_insts(&self) -> usize {
+            self.blocks.iter().map(|b| b.len()).sum()
+        }
+        fn num_blocks(&self) -> usize {
+            self.blocks.len()
+        }
+        fn entry_block(&self) -> Block {
+            Block::new(0)
+        }
+        fn block_insns(&self, block: Block) -> InstRange {
+            let start = self.first_inst_of(block.index());
+            InstRange::new(
+                Inst::new(start),
+                Inst::new(start + self.blocks[block.index()].len()),
+            )
+        }
+        fn block_succs(&self, block: Block) -> &[Block] {
+            if block.index() == 0 {
+                &self.succs_of_entry
+            } else {
+                &[]
+            }
+        }
+        fn block_preds(&self, block: Block) -> &[Block] {
+            if block.index() == 0 {
+                &[]
+            } else {
+                &self.entry_only
+            }
+        }
+        fn block_params(&self, _: Block) -> &[VReg] {
+            &[]
+        }
+        fn block_frequency(&self, block: Block) -> rgc::BlockFrequency {
+            if self.cold.contains(&block.index()) {
+                rgc::BlockFrequency::COLD
+            } else {
+                rgc::BlockFrequency::NORMAL
+            }
+        }
+        fn is_ret(&self, insn: Inst) -> bool {
+            let (block, i) = self.inst_at(insn.index());
+            block != 0 && i == self.blocks[block].len() - 1
+        }
+        fn is_branch(&self, insn: Inst) -> bool {
+            let (block, i) = self.inst_at(insn.index());
+            block == 0 && i == self.blocks[block].len() - 1
+        }
+        fn branch_blockparams(&self, _: Block, _: Inst, _: usize) -> &[VReg] {
+            &[]
+        }
+        fn inst_operands(&self, insn: Inst) -> &[Operand] {
+            let (block, i) = self.inst_at(insn.index());
+            &self.blocks[block][i]
+        }
+        fn inst_clobbers(&self, _: Inst) -> PRegSet {
+            PRegSet::empty()
+        }
+        fn num_vregs(&self) -> usize {
+            self.num_vregs
+        }
+        fn spillslot_size(&self, _: RegClass) -> usize {
+            1
         }
     }
 
@@ -1985,5 +2197,174 @@ mod tests {
                 );
             }
         }
+    }
+    /// A value the client says can be recomputed is, rather than being
+    /// spilled and reloaded, once the register file runs out.
+    #[test]
+    fn a_rematerializable_value_is_recomputed_rather_than_reloaded() {
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let def = |v| {
+            vec![Operand::new(
+                v,
+                OperandConstraint::Reg,
+                OperandKind::Def,
+                OperandPos::Late,
+            )]
+        };
+        let use_ = |v| {
+            vec![Operand::new(
+                v,
+                OperandConstraint::Reg,
+                OperandKind::Use,
+                OperandPos::Early,
+            )]
+        };
+
+        let remat = VReg::new(0, RegClass::Int);
+        let mut insts = vec![def(remat)];
+
+        // 31 values live at once, against the 32 registers granted, leaves
+        // `remat` nowhere of its own.
+        let busy: Vec<VReg> = (1..32).map(|i| VReg::new(i, RegClass::Int)).collect();
+        insts.extend(busy.iter().copied().map(def));
+        insts.extend(busy.iter().copied().map(use_));
+
+        insts.push(use_(remat));
+        insts.push(vec![]);
+
+        let func = Probe::new(insts).rematerializable(&[remat]);
+        let output = alloc(&func, &env);
+
+        let remats: Vec<_> = output
+            .edits
+            .iter()
+            .filter_map(|(_, edit)| match edit {
+                Edit::Remat { vreg, to } => Some((*vreg, *to)),
+                Edit::Move { .. } => None,
+            })
+            .collect();
+        assert!(
+            !remats.is_empty(),
+            "nothing was rematerialized, so `is_rematerializable` bought \
+             nothing here; edits were {:?}",
+            output.edits,
+        );
+        for (vreg, to) in &remats {
+            assert_eq!(
+                *vreg, remat,
+                "only the value this function called rematerializable may be \
+                 rematerialized",
+            );
+            assert!(
+                to.is_reg(),
+                "a rematerialization writes a register, but this one wrote {:?}",
+                to,
+            );
+        }
+
+        // The point of it all.
+        assert_eq!(
+            output.num_spillslots, 0,
+            "a value that can be recomputed should not need a spill slot",
+        );
+    }
+
+    /// A value only a cold block reads loses the register to one a normal
+    /// block reads.
+    ///
+    /// The reads are `Any` rather than `Reg` so a spilled value is read from
+    /// the stack; a `Reg` read would be reloaded first and the two cases would
+    /// look alike.
+    #[test]
+    fn a_cold_block_loses_its_register_to_a_warm_one() {
+        // One `Int` register, so the two values cannot both stay in one.
+        let env = MachineEnv {
+            preferred_regs_by_class: [
+                core::iter::once(PReg::new(0, RegClass::Int)).collect(),
+                PRegSet::empty(),
+                PRegSet::empty(),
+            ],
+            non_preferred_regs_by_class: [PRegSet::empty(); NUM_CLASSES],
+            scratch_by_class: [None; NUM_CLASSES],
+            fixed_stack_slots: vec![],
+        };
+
+        let first = VReg::new(0, RegClass::Int);
+        let second = VReg::new(1, RegClass::Int);
+        let def = |v| {
+            vec![Operand::new(
+                v,
+                OperandConstraint::Reg,
+                OperandKind::Def,
+                OperandPos::Late,
+            )]
+        };
+        let read = |v| {
+            vec![Operand::new(
+                v,
+                OperandConstraint::Any,
+                OperandKind::Use,
+                OperandPos::Early,
+            )]
+        };
+
+        // Each successor reads both values, so both are live throughout and
+        // one must live on the stack, but reads one far more than the other.
+        // Which lopsided block is cold is all that differs below.
+        let reads = 8;
+        let allocs = |cold: Vec<usize>| {
+            // Both values live here, but one is plainly worth more.
+            let lopsided = |heavy: VReg, light: VReg| -> Vec<Vec<Operand>> {
+                (0..reads)
+                    .map(|_| read(heavy))
+                    .chain(core::iter::once(read(light)))
+                    .chain(core::iter::once(vec![]))
+                    .collect()
+            };
+            let func = Branching::new(
+                vec![
+                    vec![def(first), def(second), vec![]],
+                    lopsided(first, second),
+                    lopsided(second, first),
+                ],
+                cold,
+                2,
+            );
+            let options = RegallocOptions {
+                algorithm: Algorithm::Regicide,
+                validate_ssa: true,
+                ..RegallocOptions::default()
+            };
+            let output = crate::run(&func, &env, &options).expect("should allocate");
+            let mut checker = Checker::new(&func, &env);
+            checker.prepare(&output);
+            checker.run().expect("checker should accept this");
+            // How many of each block's reads are served from the stack.
+            let on_stack = |block: usize| {
+                let start = func.first_inst_of(block);
+                (0..reads)
+                    .filter(|i| output.inst_allocs(Inst::new(start + i))[0].is_stack())
+                    .count()
+            };
+            (on_stack(1), on_stack(2))
+        };
+
+        // The control: one register cannot serve both values.
+        let (_, baseline_second) = allocs(vec![]);
+        assert!(
+            baseline_second > 0,
+            "this shape was supposed to force a spill even before any block \
+             was called cold",
+        );
+
+        // Now call that same block cold. Nothing else changes, so any
+        // difference is the frequency being heard.
+        let (_, second_when_cold) = allocs(vec![2]);
+        assert!(
+            second_when_cold < baseline_second,
+            "once block2 is cold its value should stop being worth the \
+             register, but {} of its reads came from the stack either way",
+            baseline_second,
+        );
     }
 }

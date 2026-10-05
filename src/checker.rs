@@ -67,6 +67,13 @@
 //!
 //!       A' = A[alloc_d → A\[alloc_s\]]
 //!
+//!   - `Edit::Remat` inserted by RA:      [ alloc_d := recompute V_i ]
+//!
+//!       A' = A[alloc_d → { V_i }]
+//!
+//!     Unlike a move, the result does not depend on what any allocation held
+//!     beforehand.
+//!
 //!   - statement in pre-regalloc function [ V_i := op V_j, V_k, ... ]
 //!     with allocated form                [ A_i := op A_j, A_k, ... ]
 //!
@@ -166,6 +173,9 @@ pub enum CheckerError {
     StackToStackMove {
         into: Allocation,
         from: Allocation,
+    },
+    RematIntoStack {
+        into: Allocation,
     },
     AllocationOutsideLimit {
         inst: Inst,
@@ -529,6 +539,20 @@ impl CheckerState {
                     return Err(CheckerError::StackToStackMove { into, from });
                 }
             }
+            &CheckerInst::Remat { into, .. } => {
+                // An instruction writes its result to a register, so a remat
+                // anywhere else could not be emitted at all.
+                let is_stack = |alloc: Allocation| {
+                    if let Some(reg) = alloc.as_reg() {
+                        checker.stack_pregs.contains(reg)
+                    } else {
+                        alloc.is_stack()
+                    }
+                };
+                if is_stack(into) {
+                    return Err(CheckerError::RematIntoStack { into });
+                }
+            }
             &CheckerInst::ParallelMove { .. } => {
                 // This doesn't need verification; we just update
                 // according to the move semantics in the step
@@ -560,6 +584,24 @@ impl CheckerState {
                     );
                     self.set_value(into, val);
                 }
+            }
+            &CheckerInst::Remat {
+                into,
+                vreg,
+                ref aliases,
+            } => {
+                // This writes `into` and touches nothing else. Unlike an
+                // `Op`'s `Def`, it does not make older copies stale: it
+                // recomputes the same value rather than a new one.
+                trace!(
+                    "checker: checkinst {:?} updating: remat {:?} -> {:?}",
+                    checkinst,
+                    vreg,
+                    into
+                );
+                let mut vregs: FxHashSet<VReg> = core::iter::once(vreg).collect();
+                vregs.extend(aliases.iter().copied());
+                self.set_value(into, CheckerValue::VRegs(vregs));
             }
             &CheckerInst::ParallelMove { ref moves } => {
                 // First, build map of actions for each vreg in an
@@ -700,6 +742,16 @@ pub(crate) enum CheckerInst {
     /// spillslots).
     Move { into: Allocation, from: Allocation },
 
+    /// `vreg` is recomputed directly into `into`, reading nothing.
+    ///
+    /// `aliases` are the other names the value answers to here; see
+    /// `Checker::delivered_params`.
+    Remat {
+        into: Allocation,
+        vreg: VReg,
+        aliases: SmallVec<[VReg; 2]>,
+    },
+
     /// A parallel move in the original program. Simultaneously moves
     /// from all source vregs to all corresponding dest vregs,
     /// permitting overlap in the src and dest sets and doing all
@@ -827,6 +879,35 @@ impl<'a, F: Function> Checker<'a, F> {
         }
     }
 
+    /// The parameters of `block` that `vreg` delivers.
+    ///
+    /// A remat atop a block names the argument its predecessor passes, since a
+    /// block parameter has no definition to re-run, but inside the block the
+    /// value goes by the parameter's name. The two are the same value only
+    /// when the block has one predecessor, so any other block gets no aliases.
+    /// One argument may deliver several parameters.
+    fn delivered_params(&self, block: Block, vreg: VReg) -> SmallVec<[VReg; 2]> {
+        let preds = self.f.block_preds(block);
+        if preds.len() != 1 || block == self.f.entry_block() {
+            return smallvec![];
+        }
+        let pred = preds[0];
+        let params = self.f.block_params(block);
+        if params.is_empty() {
+            return smallvec![];
+        }
+        let last = self.f.block_insns(pred).last();
+        let Some(index) = self.f.block_succs(pred).iter().position(|&s| s == block) else {
+            return smallvec![];
+        };
+        let args = self.f.branch_blockparams(pred, last, index);
+        args.iter()
+            .zip(params.iter())
+            .filter(|(arg, _)| **arg == vreg)
+            .map(|(_, param)| *param)
+            .collect()
+    }
+
     fn handle_edit(&mut self, block: Block, edit: &Edit) {
         trace!("checker: adding edit {:?}", edit);
         match edit {
@@ -835,6 +916,17 @@ impl<'a, F: Function> Checker<'a, F> {
                     .get_mut(&block)
                     .unwrap()
                     .push(CheckerInst::Move { into: to, from });
+            }
+            &Edit::Remat { vreg, to } => {
+                let aliases = self.delivered_params(block, vreg);
+                self.bb_insts
+                    .get_mut(&block)
+                    .unwrap()
+                    .push(CheckerInst::Remat {
+                        into: to,
+                        vreg,
+                        aliases,
+                    });
             }
         }
     }
@@ -977,6 +1069,9 @@ impl<'a, F: Function> Checker<'a, F> {
                     }
                     &CheckerInst::Move { from, into } => {
                         trace!("    {} -> {}", from, into);
+                    }
+                    &CheckerInst::Remat { into, vreg, .. } => {
+                        trace!("    remat {} -> {}", vreg, into);
                     }
                     &CheckerInst::ParallelMove { .. } => {
                         panic!("unexpected parallel_move in body (non-edge)")

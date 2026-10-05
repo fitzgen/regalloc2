@@ -112,6 +112,9 @@ fn print_output(func: &SerializableFunction, output: &Output) {
                 InstOrEdit::Edit(Edit::Move { from, to }) => {
                     println!("    edit: move {to} <- {from}");
                 }
+                InstOrEdit::Edit(Edit::Remat { vreg, to }) => {
+                    println!("    edit: remat {to} <- {vreg}");
+                }
             }
         }
     }

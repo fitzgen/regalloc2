@@ -67,10 +67,11 @@ pub mod fuzzing;
 #[cfg(feature = "regicide")]
 pub(crate) mod regicide;
 
-/// Re-exported so that [`RegallocOptions::move_elimination_level`] can be set
-/// without depending on `regicide` directly.
+/// Re-exported so that a client can set the options and answer the
+/// [`Function`] methods that take these, without depending on `regicide`
+/// directly.
 #[cfg(feature = "regicide")]
-pub use ::regicide::MoveEliminationLevel;
+pub use ::regicide::{BlockFrequency, MoveEliminationLevel, RematCost};
 
 #[cfg(feature = "enable-serde")]
 pub mod serialize;
@@ -1264,12 +1265,11 @@ pub trait Function {
     ///
     /// Only [`Algorithm::Regicide`] consults this; ion and fastalloc infer
     /// what they need from loop depth. The default answer,
-    /// [`BlockFrequency::NORMAL`][::regicide::BlockFrequency::NORMAL], says
-    /// nothing and costs nothing, so an implementor with no profile
-    /// information can leave it alone.
+    /// [`BlockFrequency::NORMAL`], says nothing and costs nothing, so an
+    /// implementor with no profile information can leave it alone.
     #[cfg(feature = "regicide")]
-    fn block_frequency(&self, _block: Block) -> ::regicide::BlockFrequency {
-        ::regicide::BlockFrequency::default()
+    fn block_frequency(&self, _block: Block) -> BlockFrequency {
+        BlockFrequency::default()
     }
 
     /// Determine whether an instruction is a return instruction.
@@ -1325,6 +1325,28 @@ pub trait Function {
 
     /// Get the number of `VReg` in use in this function.
     fn num_vregs(&self) -> usize;
+
+    /// What recomputing `vreg` costs, compared to keeping it in a register or
+    /// reloading it.
+    ///
+    /// Answering [`Some`] lets the allocator drop the value and re-execute the
+    /// instruction defining it, reported as an [`Edit::Remat`] naming whatever
+    /// register it then picks. Only [`Algorithm::Regicide`] consults this; the
+    /// default, [`None`], is always safe.
+    ///
+    /// # Which vregs may answer `Some`
+    ///
+    /// The allocator validates these, and breaking one fails the whole
+    /// allocation rather than merely allocating badly. The `vreg` must:
+    ///
+    /// * be defined by an instruction that reads no `VReg`, since those inputs
+    ///   are not available where the value is recomputed;
+    /// * not be a block parameter, which no instruction defines;
+    /// * occupy exactly one register.
+    #[cfg(feature = "regicide")]
+    fn is_rematerializable(&self, _vreg: VReg) -> Option<RematCost> {
+        None
+    }
 
     /// Get the VRegs for which we should generate value-location
     /// metadata for debugging purposes. This can be used to generate
@@ -1513,6 +1535,13 @@ pub enum Edit {
     /// are the same if the vreg changes; this allows proper metadata
     /// tracking even when moves are elided.
     Move { from: Allocation, to: Allocation },
+
+    /// Recompute `vreg` into `to` by re-executing the instruction that defines
+    /// it, rather than moving or reloading it.
+    ///
+    /// Only emitted for a vreg [`Function::is_rematerializable`] accepted.
+    /// `to` is always a register, never a spillslot.
+    Remat { vreg: VReg, to: Allocation },
 }
 
 /// Wrapper around either an original instruction or an inserted edit.

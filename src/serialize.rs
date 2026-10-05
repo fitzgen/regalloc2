@@ -46,6 +46,8 @@ pub struct SerializableFunction {
     block_params_in: Vec<Vec<VReg>>,
     block_params_out: Vec<Vec<Vec<VReg>>>,
     num_vregs: usize,
+    #[serde(default)]
+    remat_cost: Vec<(VReg, u8)>,
     debug_value_labels: Vec<(VReg, Inst, Inst, u32)>,
     spillslot_size: Vec<usize>,
     multi_spillslot_named_by_last_slot: bool,
@@ -110,6 +112,31 @@ impl SerializableFunction {
                 })
                 .collect(),
             num_vregs: func.num_vregs(),
+            remat_cost: {
+                #[cfg(feature = "regicide")]
+                {
+                    // The operands are where to find the `VReg`s, which carry
+                    // the register class the question needs.
+                    let mut costs: Vec<(VReg, u8)> = Vec::new();
+                    let mut asked = alloc::collections::BTreeSet::new();
+                    for i in 0..func.num_insts() {
+                        for op in func.inst_operands(Inst::new(i)) {
+                            let vreg = op.vreg();
+                            if !asked.insert(vreg.bits()) {
+                                continue;
+                            }
+                            if let Some(cost) = func.is_rematerializable(vreg) {
+                                costs.push((vreg, cost as u8));
+                            }
+                        }
+                    }
+                    costs
+                }
+                #[cfg(not(feature = "regicide"))]
+                {
+                    Vec::new()
+                }
+            },
             debug_value_labels: func.debug_value_labels().to_vec(),
             spillslot_size: [
                 func.spillslot_size(RegClass::Int),
@@ -179,6 +206,19 @@ impl Function for SerializableFunction {
 
     fn num_vregs(&self) -> usize {
         self.num_vregs
+    }
+
+    #[cfg(feature = "regicide")]
+    fn is_rematerializable(&self, vreg: VReg) -> Option<crate::RematCost> {
+        use crate::RematCost;
+        let (_, cost) = self.remat_cost.iter().find(|(v, _)| *v == vreg)?;
+        // The inverse of the `cost as u8` that wrote it.
+        match cost {
+            0 => Some(RematCost::AlwaysRemat),
+            1 => Some(RematCost::CheaperThanMove),
+            2 => Some(RematCost::CheaperThanReload),
+            _ => None,
+        }
     }
 
     fn debug_value_labels(&self) -> &[(VReg, Inst, Inst, u32)] {
