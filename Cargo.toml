@@ -68,7 +68,8 @@ regicide = ["dep:regicide"]
 
 # Enables capturing the input to `Algorithm::Regicide`, for replaying it outside
 # the program that produced it. Does nothing unless `REGICIDE_DUMP` names a
-# directory to write to; see the `regicide::dump` module.
+# directory to write to, and with `REGICIDE_DUMP_ONLY` also set, allocates with
+# fastalloc rather than regicide once captured; see the `regicide::dump` module.
 # `deserialize` so that a capture can be read back by the build that wrote it,
 # which is what the `regicide_dump*` tests check.
 regicide-dump = [

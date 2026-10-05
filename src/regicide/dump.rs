@@ -26,6 +26,12 @@
 //! allocation that aborts, panics or loops forever leaves its input behind
 //! too.
 //!
+//! With `REGICIDE_DUMP_ONLY` also set, regicide is never run: the function is
+//! allocated with fastalloc instead, which is far quicker and lets the client
+//! carry on to the next function. That is for building a corpus, where only
+//! the captures matter and compiling a whole program with regicide would
+//! dominate the time taken.
+//!
 //! Failing to capture never fails an allocation: a directory that cannot be
 //! created or a file that cannot be written is logged and otherwise ignored.
 //!
@@ -73,6 +79,16 @@ fn dump_dir() -> Option<&'static Path> {
         Some(dir)
     })
     .as_deref()
+}
+
+/// Whether `REGICIDE_DUMP_ONLY` asked to capture inputs without running
+/// regicide on them.
+///
+/// Only when a capture is actually being written: an allocation that is
+/// neither captured nor run by regicide is of no use to anyone.
+pub(crate) fn dump_only() -> bool {
+    static DUMP_ONLY: OnceLock<bool> = OnceLock::new();
+    dump_dir().is_some() && *DUMP_ONLY.get_or_init(|| env::var_os("REGICIDE_DUMP_ONLY").is_some())
 }
 
 /// Capture `input` if `REGICIDE_DUMP` asked for it.

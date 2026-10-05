@@ -1620,7 +1620,13 @@ pub(crate) fn run<F: Function>(
     // Captured before the run, so that an allocation that never returns still
     // leaves its input behind.
     #[cfg(feature = "regicide-dump")]
-    dump::maybe_dump(&input, func);
+    {
+        dump::maybe_dump(&input, func);
+        if dump::dump_only() {
+            *output = crate::fastalloc::run(func, env, options.verbose_log, options.validate_ssa)?;
+            return Ok(());
+        }
+    }
 
     let result = rgc::run(context, &input).map_err(map_run_error)?;
 

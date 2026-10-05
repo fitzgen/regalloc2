@@ -122,9 +122,11 @@ for wasm in "${wasms[@]}"; do
     mkdir -p "$dumps"
 
     echo "compiling $wasm..." >&2
-    # `cache=n` because a cache hit skips compilation and captures nothing, and
-    # `parallel-compilation=n` to number the captures in function order.
-    REGICIDE_DUMP="$dumps" "$wasmtime" compile \
+    # `cache=n` because a cache hit skips compilation and captures nothing,
+    # `parallel-compilation=n` to number the captures in function order, and
+    # `REGICIDE_DUMP_ONLY` to allocate with fastalloc once captured, since only
+    # the captures are kept and regicide would dominate the compile time.
+    REGICIDE_DUMP="$dumps" REGICIDE_DUMP_ONLY=1 "$wasmtime" compile \
         -O regalloc-algorithm=regicide \
         -C cache=n \
         -C parallel-compilation=n \
