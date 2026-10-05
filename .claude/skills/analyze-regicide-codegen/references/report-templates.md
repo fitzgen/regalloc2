@@ -161,6 +161,35 @@ WASMTIME_LOG=regicide::region_allocation=trace ./scripts/log \
 Profiles: `../profiles/hashset-regicide.txt`,
 `../profiles/hashset-backtracking.txt`.
 
+Render the HTML visualizations of regicide's allocations for this benchmark's
+hot functions. The `-f` filter is a case-insensitive POSIX extended regex over
+function names, so one `|`-joined invocation covers all of them at once:
+
+```bash
+cd ~/regalloc2
+./scripts/visualize -f '<hot-fn-1>|<hot-fn-2>|<hot-fn-3>' \
+    ~/sightglass/benchmarks/hashset/benchmark.wasm \
+    reports/codegen-analysis-NNN/viz/hashset/
+```
+
+Which page is which function:
+
+| hot function | visualization |
+| --- | --- |
+| `<hot-fn-1>` | [`41287-0012-<hot-fn-1>.html`](../viz/hashset/41287-0012-<hot-fn-1>.html) |
+| `<hot-fn-2>` | [`41287-0031-<hot-fn-2>.html`](../viz/hashset/41287-0031-<hot-fn-2>.html) |
+| `<hot-fn-3>` | render failed, see `viz/hashset/41287-0044-<hot-fn-3>.log` |
+
+<!-- This table is not optional and cannot be derived from the command. The
+     file names are `<pid>-<counter>-<function>.html`, and the pid is the
+     compiling process's, so nobody can predict them — take them from
+     `visualize`'s own stderr listing (it echoes each path it writes) or by
+     `ls`-ing the output directory, and record the mapping while you have it.
+     A function whose render failed leaves a `.log` beside it and no `.html`;
+     say that in the row rather than linking a page that is not there.
+     `visualize` is regicide-only, so these pages show what regicide did, not a
+     side-by-side — see references/tools.md. -->
+
 ## Hot functions
 
 Top 3 by sample share, from `scripts/profile -t`. <!-- If the benchmark has
@@ -185,6 +214,12 @@ cd ~/regalloc2
 ./scripts/disassemble -O regalloc-algorithm=backtracking \
     ~/sightglass/benchmarks/hashset/benchmark.wasm -- --filter <function> --addresses
 ```
+
+Visualization of its allocation — live ranges, splits and evictions:
+[`viz/hashset/41287-0012-<hot-fn-1>.html`](../viz/hashset/41287-0012-<hot-fn-1>.html).
+<!-- The page for this function out of the set rendered above. Name the file
+     even though the benchmark-level table already lists it: a reader who jumps
+     straight to a function should not have to scroll back up. -->
 
 Per-function allocation counts from `run.rs` (regicide only — there is no
 corpus replay for the backtracking allocator, see `references/tools.md`):

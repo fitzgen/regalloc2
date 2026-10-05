@@ -103,8 +103,15 @@ visualization is far easier to read than the log:
 
 ```bash
 ./scripts/visualize -f '<function-name>' \
-    ~/sightglass/benchmarks/bz2/benchmark.wasm $R/misc/viz-bz2/
+    ~/sightglass/benchmarks/bz2/benchmark.wasm $R/viz/bz2/
 ```
+
+Render into `$R/viz/<benchmark>/` and **link the pages from the benchmark's
+report**, with a table saying which `.html` is which hot function. The names are
+`<pid>-<counter>[-<function>].html` and the pid is the compiling process's, so
+the mapping cannot be reconstructed later from the command — read it off
+`visualize`'s stderr listing or `ls` the directory, and record it then. See
+`references/report-templates.md`.
 
 Note that `visualize` is **regicide-only** — there is no equivalent for
 regalloc2's backtracking allocator. For the backtracking side you have the

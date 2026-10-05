@@ -176,7 +176,7 @@ ls reports/                              # find the highest codegen-analysis-NNN
 # `$R` is used throughout this skill for the report directory. Set it in every
 # shell you use, since shell state does not persist between commands.
 R=reports/codegen-analysis-001
-mkdir -p $R/{misc,sightglass-data,profiles,corpus,improvements,regressions}
+mkdir -p $R/{misc,sightglass-data,profiles,corpus,viz,improvements,regressions}
 ```
 
 `NNN` is a unique, incrementing number, so that historical reports are never
@@ -188,6 +188,7 @@ clobbered: take the highest existing one and add one.
 | `sightglass-data/` | Raw sightglass CSVs, so others can re-analyze without re-measuring. |
 | `profiles/` | `scripts/profile` output you worked from. |
 | `corpus/` | `scripts/make-corpus` output, so allocations can be replayed cheaply. |
+| `viz/<benchmark>/` | `scripts/visualize` HTML pages, one per allocation, which the per-benchmark reports link to (§5). |
 | `improvements/` | One `.md` per most-improved benchmark (§5). |
 | `regressions/` | One `.md` per most-regressed benchmark (§5). |
 | `misc/` | Everything else worth keeping: environment facts, tool gotchas, hard-won insights, things that should be added to this skill. Use it freely. |
@@ -528,10 +529,35 @@ In short, each per-benchmark report contains:
 - the date and time, and the benchmark's speedup or slowdown (with the metric
   and whether it was significant);
 - the `scripts/log` command that reproduces the compile with logging;
+- the `scripts/visualize` command that renders the HTML visualizations for this
+  benchmark's hot functions, into `$R/viz/<benchmark>/`, **plus a table saying
+  which generated `.html` file corresponds to which hot function**;
 - the 3 hottest functions, each with its sample share, the `run.rs` command for
-  its corpus input, and the `scripts/disassemble` command for its disassembly;
+  its corpus input, the `scripts/disassemble` command for its disassembly, and a
+  link to its visualization page;
 - for each function, its 3 hottest basic blocks, each with the disassembly under
   both allocators and an analysis of what the allocator did differently.
+
+The visualization filenames are **not predictable**: a dump is named
+`<pid>-<counter>[-<function>].postcard`, so the page is
+`<pid>-<counter>[-<function>].html` with the *compiling process's* pid in it.
+Take the mapping from `visualize`'s stderr, which echoes every path it writes,
+or from `ls $R/viz/<benchmark>/`, and write it into the report while you have
+it — a reader cannot reconstruct it from the command alone. A function that
+failed to render leaves a `.log` and no `.html`; say that instead of linking a
+page that does not exist.
+
+```bash
+cd ~/regalloc2
+./scripts/visualize -f 'hot_fn_1|hot_fn_2|hot_fn_3' \
+    ~/sightglass/benchmarks/bz2/benchmark.wasm $R/viz/bz2/
+ls $R/viz/bz2/
+```
+
+`-f` is a case-insensitive POSIX extended regex, so one `|`-joined invocation
+covers all three hot functions and skips the rest of the module — which matters,
+since a benchmark is hundreds of functions and each page is a separate compile's
+worth of rendering.
 
 Work down the "why" ladder for each block, not just the first level:
 

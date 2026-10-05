@@ -236,6 +236,14 @@ input under `<out>/dumps/`, then rendering each with regicide's `visualize`
 example. A single allocation that fails to render does not sink the
 rest; its error goes to `<out>/<name>.log`.
 
+Each page is `<out>/<pid>-<counter>[-<function>].html`, matching its capture's
+name: the pid is the *compiling process's*, and the counter is in function order
+(`parallel-compilation=n`). So **the filename for a given function is not
+predictable before the run** — take it from the stderr listing, which echoes
+every path written, or by `ls`-ing the output directory afterwards. An
+unnameable function gets no `-<function>` part and can only be identified by its
+counter.
+
 **Regicide only.** There is no equivalent for regalloc2's backtracking
 allocator, so a visualization shows you what regicide did, not a side-by-side.
 
