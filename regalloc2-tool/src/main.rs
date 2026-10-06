@@ -117,6 +117,17 @@ fn print_output(func: &SerializableFunction, output: &Output) {
                 }
             }
         }
+        for edge_edit in output.critical_edge_edits(block) {
+            let succ = func.block_succs(block)[edge_edit.succ_idx as usize].index();
+            match &edge_edit.edit {
+                Edit::Move { from, to } => {
+                    println!("    edge to block{succ}: move {to} <- {from}");
+                }
+                Edit::Remat { vreg, to } => {
+                    println!("    edge to block{succ}: remat {to} <- {vreg}");
+                }
+            }
+        }
     }
     println!("}}");
 }

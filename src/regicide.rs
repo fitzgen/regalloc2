@@ -1384,41 +1384,33 @@ fn translate_alloc(
     }
 }
 
-/// Translate one of regicide's edits.
+/// Translate one of regicide's moves or rematerializations, wherever it sits.
 fn translate_edit(
     machine: &MachineCache,
     prepass: &Prepass,
     spillslot_map: &[u32],
-    edit: rgc::Edit,
-) -> Result<Edit, RegAllocError> {
+    edit: rgc::EdgeEdit,
+) -> Edit {
     let reg = |reg: rgc::Reg| Allocation::reg(machine.preg_of_reg[reg.index()]);
     let slot =
         |slot: rgc::SpillSlot| Allocation::stack(SpillSlot::new(spillslot_map[slot.index()] as _));
 
-    // `Edit::CriticalEdge` cannot happen, because `CFGInfo::init` has already
-    // rejected every function with a critical edge regicide would want to
-    // split.
     let mv = match edit {
-        rgc::Edit::Move(mv) => mv,
-        rgc::Edit::Remat(rgc::Remat { val, dest }) => {
+        rgc::EdgeEdit::Move(mv) => mv,
+        rgc::EdgeEdit::Remat(rgc::Remat { val, dest }) => {
             // This names the vreg whose defining instruction the client
-            // re-executes, so atop a block it stays the predecessor's
-            // argument rather than the parameter it delivers: a parameter has
-            // no definition to re-run. The checker handles that renaming.
-            return Ok(Edit::Remat {
+            // re-executes, so atop a block or on a critical edge it stays the
+            // predecessor's argument rather than the parameter it delivers: a
+            // parameter has no definition to re-run. The checker handles that
+            // renaming.
+            return Edit::Remat {
                 vreg: prepass.val_to_vreg[val.index()],
                 to: reg(dest),
-            });
-        }
-        edit => {
-            return Err(shim_error(format!(
-                "regicide emitted {:?}, which this crate's `Edit` cannot express",
-                edit
-            )))
+            };
         }
     };
 
-    Ok(match mv {
+    match mv {
         rgc::Move::RegReg { from, to } => Edit::Move {
             from: reg(from),
             to: reg(to),
@@ -1431,7 +1423,7 @@ fn translate_edit(
             from: slot(from),
             to: reg(to),
         },
-    })
+    }
 }
 
 /// Write regicide's answer into `output` in this crate's terms.
@@ -1442,6 +1434,7 @@ fn translate_output<F: Function>(
     result: &rgc::Output<'_>,
     output: &mut crate::Output,
     spillslot_map: &mut Vec<u32>,
+    allow_critical_edges: bool,
 ) -> Result<(), RegAllocError> {
     let num_insts = func.num_insts();
 
@@ -1454,6 +1447,7 @@ fn translate_output<F: Function>(
     // regicide has no such notion, so there is nothing to report.
     output.debug_locations.clear();
     output.edits.clear();
+    output.critical_edge_edits.clear();
     output.stats = Default::default();
 
     // Lay regicide's spill slots out in this crate's slot space, by the very
@@ -1520,8 +1514,36 @@ fn translate_output<F: Function>(
                         last = Some(at);
                     }
                 }
+                rgc::InstOrEdit::Edit(rgc::Edit::CriticalEdge(rgc::CriticalEdgeEdit {
+                    target,
+                    succ,
+                    edit,
+                })) => {
+                    // `CFGInfo::init` rejects every function regicide would
+                    // want to split an edge of, unless the client asked to
+                    // split them itself.
+                    if !allow_critical_edges {
+                        return Err(shim_error(format!(
+                            "regicide put {:?} on a critical edge, which the client \
+                             did not allow",
+                            edit
+                        )));
+                    }
+                    let block = Block::new(b);
+                    debug_assert_eq!(func.block_succs(block)[succ], Block::new(target.index()));
+                    output.critical_edge_edits.push(crate::CriticalEdgeEdit {
+                        block,
+                        succ_idx: u32::try_from(succ).expect("regicide bounds successors"),
+                        edit: translate_edit(machine, adaptor.prepass, spillslot_map, edit),
+                    });
+                }
                 rgc::InstOrEdit::Edit(edit) => {
-                    let edit = translate_edit(machine, adaptor.prepass, spillslot_map, edit)?;
+                    let edit = match edit {
+                        rgc::Edit::Move(mv) => rgc::EdgeEdit::Move(mv),
+                        rgc::Edit::Remat(remat) => rgc::EdgeEdit::Remat(remat),
+                        rgc::Edit::CriticalEdge(_) => unreachable!("handled above"),
+                    };
+                    let edit = translate_edit(machine, adaptor.prepass, spillslot_map, edit);
                     output.edits.push((ProgPoint::before(Inst::new(0)), edit));
                     pending += 1;
                 }
@@ -1529,7 +1551,8 @@ fn translate_output<F: Function>(
         }
 
         // regicide never places a move or a remat after a block's terminator,
-        // so the stream always ends with an instruction to anchor to.
+        // so the stream always ends with an instruction to anchor to. Only
+        // critical-edge edits come after it, and those are not pending.
         if pending != 0 {
             return Err(shim_error(String::from(
                 "regicide placed an edit after a block's terminator, where this \
@@ -1579,10 +1602,12 @@ pub(crate) fn run<F: Function>(
         ..
     } = ctx;
 
-    // This both builds the dominator tree regicide asks about and performs the
-    // critical-edge and branch-argument checks that make `Edit::CriticalEdge`
-    // unreachable.
-    cfginfo.init(func, cfginfo_ctx)?;
+    let allow_critical_edges = options.allow_critical_edges && supports_critical_edges();
+
+    // This both builds the dominator tree regicide asks about and, unless the
+    // client splits critical edges itself, performs the critical-edge and
+    // branch-argument checks that make `Edit::CriticalEdge` unreachable.
+    cfginfo.init(func, cfginfo_ctx, allow_critical_edges)?;
     let cfginfo = &*cfginfo;
 
     let key = MachineKey::new(func, env);
@@ -1630,7 +1655,25 @@ pub(crate) fn run<F: Function>(
 
     let result = rgc::run(context, &input).map_err(map_run_error)?;
 
-    translate_output(func, machine, &adaptor, &result, output, spillslot_map)
+    translate_output(
+        func,
+        machine,
+        &adaptor,
+        &result,
+        output,
+        spillslot_map,
+        allow_critical_edges,
+    )
+}
+
+/// Whether a run will really be regicide's, and so can report critical-edge
+/// edits; see `Algorithm::supports_critical_edges`.
+pub(crate) fn supports_critical_edges() -> bool {
+    #[cfg(feature = "regicide-dump")]
+    if dump::dump_only() {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -2447,5 +2490,272 @@ mod tests {
              register, but {} of its reads came from the stack either way",
             baseline_second,
         );
+    }
+
+    /// A function of any shape, for the tests that need block parameters or
+    /// critical edges.
+    struct Cfg {
+        /// Each block's instructions, as operand lists; the last one in each
+        /// block is its terminator.
+        insts: Vec<Vec<Vec<Operand>>>,
+        params: Vec<Vec<VReg>>,
+        succs: Vec<Vec<Block>>,
+        /// The arguments each block passes along each of its edges.
+        args: Vec<Vec<Vec<VReg>>>,
+        preds: Vec<Vec<Block>>,
+        num_vregs: usize,
+    }
+
+    /// One block of a `Cfg`: its parameters, its instructions, and each edge
+    /// it leaves by with the arguments passed along it.
+    type CfgBlock = (Vec<VReg>, Vec<Vec<Operand>>, Vec<(usize, Vec<VReg>)>);
+
+    impl Cfg {
+        fn new(blocks: Vec<CfgBlock>) -> Self {
+            let mut preds = vec![vec![]; blocks.len()];
+            let mut num_vregs = 0;
+            let mut cfg = Cfg {
+                insts: vec![],
+                params: vec![],
+                succs: vec![],
+                args: vec![],
+                preds: vec![],
+                num_vregs: 0,
+            };
+            for (b, (params, insts, edges)) in blocks.into_iter().enumerate() {
+                let vregs = params
+                    .iter()
+                    .copied()
+                    .chain(insts.iter().flatten().map(|op| op.vreg()))
+                    .chain(edges.iter().flat_map(|(_, args)| args.iter().copied()));
+                for vreg in vregs {
+                    num_vregs = num_vregs.max(vreg.vreg() + 1);
+                }
+                for (succ, _) in &edges {
+                    preds[*succ].push(Block::new(b));
+                }
+                cfg.params.push(params);
+                cfg.insts.push(insts);
+                cfg.succs
+                    .push(edges.iter().map(|(succ, _)| Block::new(*succ)).collect());
+                cfg.args
+                    .push(edges.into_iter().map(|(_, args)| args).collect());
+            }
+            cfg.preds = preds;
+            cfg.num_vregs = num_vregs;
+            cfg
+        }
+
+        fn first_inst_of(&self, block: usize) -> usize {
+            self.insts[..block].iter().map(|b| b.len()).sum()
+        }
+
+        fn inst_at(&self, inst: usize) -> (usize, usize) {
+            let mut start = 0;
+            for (b, insts) in self.insts.iter().enumerate() {
+                if inst < start + insts.len() {
+                    return (b, inst - start);
+                }
+                start += insts.len();
+            }
+            panic!("inst{} is past the end of the function", inst)
+        }
+
+        fn is_terminator(&self, insn: Inst) -> Option<usize> {
+            let (block, i) = self.inst_at(insn.index());
+            (i == self.insts[block].len() - 1).then_some(block)
+        }
+    }
+
+    impl Function for Cfg {
+        fn num_insts(&self) -> usize {
+            self.insts.iter().map(|b| b.len()).sum()
+        }
+        fn num_blocks(&self) -> usize {
+            self.insts.len()
+        }
+        fn entry_block(&self) -> Block {
+            Block::new(0)
+        }
+        fn block_insns(&self, block: Block) -> InstRange {
+            let start = self.first_inst_of(block.index());
+            InstRange::new(
+                Inst::new(start),
+                Inst::new(start + self.insts[block.index()].len()),
+            )
+        }
+        fn block_succs(&self, block: Block) -> &[Block] {
+            &self.succs[block.index()]
+        }
+        fn block_preds(&self, block: Block) -> &[Block] {
+            &self.preds[block.index()]
+        }
+        fn block_params(&self, block: Block) -> &[VReg] {
+            &self.params[block.index()]
+        }
+        fn is_ret(&self, insn: Inst) -> bool {
+            self.is_terminator(insn)
+                .map_or(false, |b| self.succs[b].is_empty())
+        }
+        fn is_branch(&self, insn: Inst) -> bool {
+            self.is_terminator(insn)
+                .map_or(false, |b| !self.succs[b].is_empty())
+        }
+        fn branch_blockparams(&self, block: Block, _: Inst, succ_idx: usize) -> &[VReg] {
+            &self.args[block.index()][succ_idx]
+        }
+        fn inst_operands(&self, insn: Inst) -> &[Operand] {
+            let (block, i) = self.inst_at(insn.index());
+            &self.insts[block][i]
+        }
+        fn inst_clobbers(&self, _: Inst) -> PRegSet {
+            PRegSet::empty()
+        }
+        fn num_vregs(&self) -> usize {
+            self.num_vregs
+        }
+        fn spillslot_size(&self, _: RegClass) -> usize {
+            1
+        }
+    }
+
+    /// Allocate `func` with regicide, letting it keep its critical edges, and
+    /// run this crate's checker over the result.
+    fn alloc_with_critical_edges(func: &Cfg) -> Output {
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let options = RegallocOptions {
+            algorithm: Algorithm::Regicide,
+            validate_ssa: true,
+            allow_critical_edges: true,
+            ..RegallocOptions::default()
+        };
+        let output = crate::run(func, &env, &options).expect("regicide should allocate this");
+        let mut checker = Checker::new(func, &env);
+        checker.prepare(&output);
+        checker.run().expect("checker should accept this");
+        output
+    }
+
+    fn fixed_def(vreg: VReg, preg: usize) -> Vec<Operand> {
+        vec![Operand::new(
+            vreg,
+            OperandConstraint::FixedReg(PReg::new(preg, vreg.class())),
+            OperandKind::Def,
+            OperandPos::Late,
+        )]
+    }
+
+    fn any_use(vreg: VReg) -> Operand {
+        Operand::new(
+            vreg,
+            OperandConstraint::Any,
+            OperandKind::Use,
+            OperandPos::Early,
+        )
+    }
+
+    /// block0 defines `a` and `b`, then branches to block1 twice, passing `a`
+    /// along one edge and `b` along the other. Both edges are critical, and
+    /// since `a` and `b` cannot share a register, at least one of them needs a
+    /// move.
+    fn twice_to_one_block() -> Cfg {
+        let a = VReg::new(0, RegClass::Int);
+        let b = VReg::new(1, RegClass::Int);
+        let p = VReg::new(2, RegClass::Int);
+        Cfg::new(vec![
+            (
+                vec![],
+                vec![fixed_def(a, 0), fixed_def(b, 1), vec![any_use(a)]],
+                vec![(1, vec![a]), (1, vec![b])],
+            ),
+            (vec![p], vec![vec![any_use(p)], vec![]], vec![]),
+        ])
+    }
+
+    #[test]
+    fn critical_edges_are_refused_unless_allowed() {
+        let func = twice_to_one_block();
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let options = RegallocOptions {
+            algorithm: Algorithm::Regicide,
+            ..RegallocOptions::default()
+        };
+        assert!(matches!(
+            crate::run(&func, &env, &options),
+            Err(RegAllocError::CritEdge(..) | RegAllocError::DisallowedBranchArg(..))
+        ));
+    }
+
+    #[test]
+    fn two_critical_edges_to_one_block() {
+        let output = alloc_with_critical_edges(&twice_to_one_block());
+        assert!(
+            !output.critical_edge_edits.is_empty(),
+            "one of the edges needs a move"
+        );
+        assert!(output
+            .critical_edge_edits
+            .iter()
+            .all(|e| e.block == Block::new(0)));
+        assert_eq!(
+            output.critical_edge_edits(Block::new(0)).len(),
+            output.critical_edge_edits.len()
+        );
+        assert!(output.critical_edge_edits(Block::new(1)).is_empty());
+
+        // The checker must see that the edge goes without its move.
+        let func = twice_to_one_block();
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let mut unsplit = output.clone();
+        unsplit.critical_edge_edits.clear();
+        let mut checker = Checker::new(&func, &env);
+        checker.prepare(&unsplit);
+        assert!(checker.run().is_err());
+    }
+
+    /// A diamond whose join takes `x` and `y` from one side and swapped from
+    /// the other, where both sides branch away again, so that every edge into
+    /// the join is critical and one of them has to swap the two.
+    #[test]
+    fn swapping_on_a_critical_edge() {
+        let x = VReg::new(0, RegClass::Int);
+        let y = VReg::new(1, RegClass::Int);
+        let p = VReg::new(2, RegClass::Int);
+        let q = VReg::new(3, RegClass::Int);
+        let func = Cfg::new(vec![
+            (
+                vec![],
+                vec![fixed_def(x, 0), fixed_def(y, 1), vec![any_use(x)]],
+                vec![(1, vec![]), (2, vec![x, y])],
+            ),
+            (
+                vec![],
+                vec![vec![any_use(y)]],
+                vec![(2, vec![y, x]), (3, vec![])],
+            ),
+            (
+                vec![p, q],
+                vec![vec![any_use(p), any_use(q)], vec![]],
+                vec![],
+            ),
+            (vec![], vec![vec![]], vec![]),
+        ]);
+        let output = alloc_with_critical_edges(&func);
+        assert!(!output.critical_edge_edits.is_empty());
+        let mut keys: Vec<_> = output
+            .critical_edge_edits
+            .iter()
+            .map(|e| (e.block, e.succ_idx))
+            .collect();
+        let sorted = {
+            let mut sorted = keys.clone();
+            sorted.sort();
+            sorted
+        };
+        assert_eq!(keys, sorted, "critical-edge edits are sorted by edge");
+        keys.dedup();
+        for (block, succ_idx) in keys {
+            assert_eq!(func.block_succs(block)[succ_idx as usize], Block::new(2));
+        }
     }
 }

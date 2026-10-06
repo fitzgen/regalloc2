@@ -24,6 +24,7 @@ const OPTIONS: func::Options = func::Options {
     reftypes: true,
     remat: true,
     callsite_ish_constraints: true,
+    critical_edges: true,
     fixed_reg_max: 31,
     ..func::Options::DEFAULT
 };
@@ -96,6 +97,7 @@ pub fn check(t: TestCase) {
         validate_ssa: *check_ssa,
         algorithm: Algorithm::Regicide,
         move_elimination_level: *move_elimination_level,
+        allow_critical_edges: true,
     };
 
     thread_local! {

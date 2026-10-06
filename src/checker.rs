@@ -103,9 +103,9 @@
 #![allow(dead_code)]
 
 use crate::{
-    Allocation, AllocationKind, Block, Edit, Function, FxHashMap, FxHashSet, Inst, InstOrEdit,
-    InstPosition, MachineEnv, Operand, OperandConstraint, OperandKind, OperandPos, Output, PReg,
-    PRegSet, VReg,
+    Allocation, AllocationKind, Block, CriticalEdgeEdit, Edit, Function, FxHashMap, FxHashSet,
+    Inst, InstOrEdit, InstPosition, MachineEnv, Operand, OperandConstraint, OperandKind,
+    OperandPos, Output, PReg, PRegSet, VReg,
 };
 use alloc::vec::Vec;
 use alloc::{format, vec};
@@ -777,7 +777,9 @@ pub struct Checker<'a, F: Function> {
     f: &'a F,
     bb_in: FxHashMap<Block, CheckerState>,
     bb_insts: FxHashMap<Block, Vec<CheckerInst>>,
-    edge_insts: FxHashMap<(Block, Block), Vec<CheckerInst>>,
+    /// Keyed by block and successor index, so that two edges to one block
+    /// stay distinct.
+    edge_insts: FxHashMap<(Block, usize), Vec<CheckerInst>>,
     machine_env: &'a MachineEnv,
     stack_pregs: PRegSet,
 }
@@ -796,8 +798,8 @@ impl<'a, F: Function> Checker<'a, F> {
             let block = Block::new(block);
             bb_in.insert(block, Default::default());
             bb_insts.insert(block, vec![]);
-            for &succ in f.block_succs(block) {
-                edge_insts.insert((block, succ), vec![]);
+            for succ_idx in 0..f.block_succs(block).len() {
+                edge_insts.insert((block, succ_idx), vec![]);
             }
         }
 
@@ -825,6 +827,11 @@ impl<'a, F: Function> Checker<'a, F> {
         let mut last_inst = None;
         for block in 0..self.f.num_blocks() {
             let block = Block::new(block);
+            // Ahead of the branch's `ParallelMove`, because these edits run
+            // on the arguments, before they become the successor's params.
+            for edge_edit in out.critical_edge_edits(block) {
+                self.handle_critical_edge_edit(edge_edit);
+            }
             for inst_or_edit in out.block_insts_and_edits(self.f, block) {
                 match inst_or_edit {
                     InstOrEdit::Inst(inst) => {
@@ -871,7 +878,7 @@ impl<'a, F: Function> Checker<'a, F> {
                 if args.len() > 0 {
                     let moves = params.iter().cloned().zip(args.iter().cloned()).collect();
                     self.edge_insts
-                        .get_mut(&(block, succ))
+                        .get_mut(&(block, i))
                         .unwrap()
                         .push(CheckerInst::ParallelMove { moves });
                 }
@@ -931,6 +938,24 @@ impl<'a, F: Function> Checker<'a, F> {
         }
     }
 
+    fn handle_critical_edge_edit(&mut self, edge_edit: &CriticalEdgeEdit) {
+        trace!("checker: adding critical-edge edit {:?}", edge_edit);
+        let checkinst = match edge_edit.edit {
+            Edit::Move { from, to } => CheckerInst::Move { into: to, from },
+            // The edge's `ParallelMove` renames the argument this names into
+            // the param it delivers, so there are no aliases to add here.
+            Edit::Remat { vreg, to } => CheckerInst::Remat {
+                into: to,
+                vreg,
+                aliases: smallvec![],
+            },
+        };
+        self.edge_insts
+            .get_mut(&(edge_edit.block, edge_edit.succ_idx as usize))
+            .expect("a critical-edge edit names one of its block's successors")
+            .push(checkinst);
+    }
+
     /// Perform the dataflow analysis to compute checker state at each BB entry.
     fn analyze(&mut self) {
         let mut queue = Vec::new();
@@ -959,9 +984,9 @@ impl<'a, F: Function> Checker<'a, F> {
                 trace!("analyze: inst {:?} -> state {:?}", inst, state);
             }
 
-            for &succ in self.f.block_succs(block) {
+            for (succ_idx, &succ) in self.f.block_succs(block).iter().enumerate() {
                 let mut new_state = state.clone();
-                for edge_inst in self.edge_insts.get(&(block, succ)).unwrap() {
+                for edge_inst in self.edge_insts.get(&(block, succ_idx)).unwrap() {
                     new_state.update(edge_inst);
                     trace!(
                         "analyze: succ {:?}: inst {:?} -> state {:?}",
@@ -1015,6 +1040,16 @@ impl<'a, F: Function> Checker<'a, F> {
                 if let Err(e) = state.check(InstPosition::After, inst, self) {
                     trace!("Checker error: {:?}", e);
                     errors.push(e);
+                }
+            }
+            for succ_idx in 0..self.f.block_succs(*block).len() {
+                let mut state = state.clone();
+                for inst in self.edge_insts.get(&(*block, succ_idx)).unwrap() {
+                    if let Err(e) = state.check(InstPosition::Before, inst, self) {
+                        trace!("Checker error: {:?}", e);
+                        errors.push(e);
+                    }
+                    state.update(inst);
                 }
             }
         }
@@ -1081,10 +1116,10 @@ impl<'a, F: Function> Checker<'a, F> {
                 print_state(&state);
             }
 
-            for &succ in self.f.block_succs(bb) {
+            for (succ_idx, &succ) in self.f.block_succs(bb).iter().enumerate() {
                 trace!("  succ {:?}:", succ);
                 let mut state = state.clone();
-                for edge_inst in self.edge_insts.get(&(bb, succ)).unwrap() {
+                for edge_inst in self.edge_insts.get(&(bb, succ_idx)).unwrap() {
                     match edge_inst {
                         &CheckerInst::ParallelMove { ref moves } => {
                             let moves = moves
@@ -1093,7 +1128,13 @@ impl<'a, F: Function> Checker<'a, F> {
                                 .collect::<Vec<_>>();
                             trace!("    parallel_move {}", moves.join(", "));
                         }
-                        _ => panic!("unexpected edge_inst: not a parallel move"),
+                        &CheckerInst::Move { from, into } => {
+                            trace!("    {} -> {}", from, into);
+                        }
+                        &CheckerInst::Remat { into, vreg, .. } => {
+                            trace!("    remat {} -> {}", vreg, into);
+                        }
+                        &CheckerInst::Op { .. } => panic!("unexpected op on an edge"),
                     }
                     state.update(edge_inst);
                     print_state(&state);

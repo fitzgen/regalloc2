@@ -1632,6 +1632,7 @@ pub fn run<F: Function>(
 
     Ok(Output {
         edits: env.state.edits,
+        critical_edge_edits: Vec::new(),
         allocs: env.allocs.allocs,
         inst_alloc_offsets: env.allocs.inst_alloc_offsets,
         num_spillslots: env.state.stack.num_spillslots as usize,

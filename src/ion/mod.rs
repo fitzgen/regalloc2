@@ -75,6 +75,7 @@ impl<'a, F: Function> Env<'a, F> {
         ctx.output.num_spillslots = 0;
         ctx.output.debug_locations.clear();
         ctx.output.edits.clear();
+        ctx.output.critical_edge_edits.clear();
         ctx.output.stats = Stats::default();
 
         Self { func, env, ctx }
@@ -112,7 +113,7 @@ pub fn run<F: Function>(
     enable_annotations: bool,
     enable_ssa_checker: bool,
 ) -> Result<(), RegAllocError> {
-    ctx.cfginfo.init(func, &mut ctx.cfginfo_ctx)?;
+    ctx.cfginfo.init(func, &mut ctx.cfginfo_ctx, false)?;
 
     if enable_ssa_checker {
         validate_ssa(func, &ctx.cfginfo)?;

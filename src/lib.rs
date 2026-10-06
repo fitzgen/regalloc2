@@ -1555,6 +1555,29 @@ pub enum Edit {
     Remat { vreg: VReg, to: Allocation },
 }
 
+/// An edit that belongs on a control-flow edge the client must split.
+///
+/// Only produced when [`RegallocOptions::allow_critical_edges`] is set and the
+/// algorithm [supports it][Algorithm::supports_critical_edges]. The client
+/// splits the edge from `block` to its `succ_idx`th successor by inserting a
+/// new block that performs the edge's edits, in order, and then jumps to that
+/// successor.
+///
+/// These edits run after `block`'s terminator and before the edge's branch
+/// arguments become the successor's block parameters. So they operate on the
+/// argument vregs, and a [`Edit::Remat`] here names an argument vreg rather
+/// than the parameter it is passed to.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct CriticalEdgeEdit {
+    /// The block the edge leaves.
+    pub block: Block,
+    /// The edge's index in `block`'s [`Function::block_succs`].
+    pub succ_idx: u32,
+    /// The edit to perform on the edge.
+    pub edit: Edit,
+}
+
 /// Wrapper around either an original instruction or an inserted edit.
 #[derive(Clone, Debug)]
 pub enum InstOrEdit<'a> {
@@ -1655,6 +1678,13 @@ pub struct Output {
     /// program point.
     pub edits: Vec<(ProgPoint, Edit)>,
 
+    /// Edits that go on critical edges, which the client must split.
+    ///
+    /// Always empty unless [`RegallocOptions::allow_critical_edges`] was set.
+    /// Sorted by block and then successor index, and within one edge, in the
+    /// order the edits must run. See [`CriticalEdgeEdit`].
+    pub critical_edge_edits: Vec<CriticalEdgeEdit>,
+
     /// Allocations for each operand. Mapping from instruction to
     /// allocations provided by `inst_alloc_offsets` below.
     pub allocs: Vec<Allocation>,
@@ -1708,6 +1738,16 @@ impl Output {
 
         let edits = &self.edits[edit_idx..];
         OutputIter { inst_range, edits }
+    }
+
+    /// The edits on every critical edge leaving `block`, sorted by successor
+    /// index.
+    pub fn critical_edge_edits(&self, block: Block) -> &[CriticalEdgeEdit] {
+        let start = self
+            .critical_edge_edits
+            .partition_point(|e| e.block < block);
+        let end = start + self.critical_edge_edits[start..].partition_point(|e| e.block == block);
+        &self.critical_edge_edits[start..end]
     }
 }
 
@@ -1834,6 +1874,25 @@ pub enum Algorithm {
     Regicide,
 }
 
+impl Algorithm {
+    /// Will this algorithm honor [`RegallocOptions::allow_critical_edges`]?
+    ///
+    /// A client that keeps its critical edges for the allocator to report on
+    /// must check this first: every other algorithm requires critical edges to
+    /// be split before allocation.
+    ///
+    /// With the `regicide-dump` feature and `REGICIDE_DUMP_ONLY` set,
+    /// [`Algorithm::Regicide`] allocates with fastalloc rather than regicide,
+    /// and so returns `false` here.
+    pub fn supports_critical_edges(self) -> bool {
+        match self {
+            Algorithm::Ion | Algorithm::Fastalloc => false,
+            #[cfg(feature = "regicide")]
+            Algorithm::Regicide => regicide::supports_critical_edges(),
+        }
+    }
+}
+
 /// Options for allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RegallocOptions {
@@ -1851,6 +1910,18 @@ pub struct RegallocOptions {
     /// Ignored by every algorithm but [`Algorithm::Regicide`].
     #[cfg(feature = "regicide")]
     pub move_elimination_level: ::regicide::MoveEliminationLevel,
+
+    /// Accept a function whose critical edges are not split.
+    ///
+    /// The function may then have critical edges, and a terminator may have
+    /// operands even when one of its successors has several predecessors.
+    /// Edits the allocator needs on such an edge are reported in
+    /// [`Output::critical_edge_edits`], and the client must split each edge
+    /// with edits on it.
+    ///
+    /// Honored only by algorithms whose
+    /// [`Algorithm::supports_critical_edges`] is true, and ignored by the rest.
+    pub allow_critical_edges: bool,
 }
 
 pub(crate) trait VecExt<T> {

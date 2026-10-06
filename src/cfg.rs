@@ -43,11 +43,20 @@ impl CFGInfo {
     pub fn new<F: Function>(f: &F) -> Result<Self, RegAllocError> {
         let mut ctx = CFGInfoCtx::default();
         let mut this = Self::default();
-        this.init(f, &mut ctx)?;
+        this.init(f, &mut ctx, false)?;
         Ok(this)
     }
 
-    pub fn init<F: Function>(&mut self, f: &F, ctx: &mut CFGInfoCtx) -> Result<(), RegAllocError> {
+    /// Compute the CFG info for `f`.
+    ///
+    /// Unless `allow_critical_edges`, also check that `f` has no critical
+    /// edges and no terminator operands on an edge into a join.
+    pub fn init<F: Function>(
+        &mut self,
+        f: &F,
+        ctx: &mut CFGInfoCtx,
+        allow_critical_edges: bool,
+    ) -> Result<(), RegAllocError> {
         let nb = f.num_blocks();
 
         postorder::calculate(
@@ -84,36 +93,40 @@ impl CFGInfo {
             block_entry[block.index()] = ProgPoint::before(f.block_insns(block).first());
             block_exit[block.index()] = ProgPoint::after(f.block_insns(block).last());
 
-            // Check critical edge condition: if there is more than
-            // one predecessor, each must have only one successor
-            // (this block).
-            let preds = f.block_preds(block).len() + if block == f.entry_block() { 1 } else { 0 };
-            if preds > 1 {
-                for &pred in f.block_preds(block) {
-                    let succs = f.block_succs(pred).len();
-                    if succs > 1 {
-                        return Err(RegAllocError::CritEdge(pred, block));
+            if !allow_critical_edges {
+                // Check critical edge condition: if there is more than
+                // one predecessor, each must have only one successor
+                // (this block).
+                let preds =
+                    f.block_preds(block).len() + if block == f.entry_block() { 1 } else { 0 };
+                if preds > 1 {
+                    for &pred in f.block_preds(block) {
+                        let succs = f.block_succs(pred).len();
+                        if succs > 1 {
+                            return Err(RegAllocError::CritEdge(pred, block));
+                        }
                     }
                 }
-            }
 
-            // Check branch-arg condition: if any successors have more
-            // than one predecessor (given above, there will only be
-            // one such successor), then the last instruction of this
-            // block (the branch) cannot have any args other than the
-            // blockparams.
-            let mut require_no_branch_args = false;
-            for &succ in f.block_succs(block) {
-                let preds = f.block_preds(succ).len() + if succ == f.entry_block() { 1 } else { 0 };
-                if preds > 1 {
-                    require_no_branch_args = true;
-                    break;
+                // Check branch-arg condition: if any successors have more
+                // than one predecessor (given above, there will only be
+                // one such successor), then the last instruction of this
+                // block (the branch) cannot have any args other than the
+                // blockparams.
+                let mut require_no_branch_args = false;
+                for &succ in f.block_succs(block) {
+                    let preds =
+                        f.block_preds(succ).len() + if succ == f.entry_block() { 1 } else { 0 };
+                    if preds > 1 {
+                        require_no_branch_args = true;
+                        break;
+                    }
                 }
-            }
-            if require_no_branch_args {
-                let last = f.block_insns(block).last();
-                if !f.inst_operands(last).is_empty() {
-                    return Err(RegAllocError::DisallowedBranchArg(last));
+                if require_no_branch_args {
+                    let last = f.block_insns(block).last();
+                    if !f.inst_operands(last).is_empty() {
+                        return Err(RegAllocError::DisallowedBranchArg(last));
+                    }
                 }
             }
 

@@ -384,6 +384,9 @@ pub struct Options {
     pub reftypes: bool,
     pub remat: bool,
     pub callsite_ish_constraints: bool,
+    /// Generate critical edges, and branches that have operands of their own,
+    /// for an allocator run with `RegallocOptions::allow_critical_edges`.
+    pub critical_edges: bool,
     pub num_blocks: RangeInclusive<usize>,
     pub num_vregs_per_block: RangeInclusive<usize>,
     pub num_uses_per_inst: RangeInclusive<usize>,
@@ -409,6 +412,7 @@ impl Options {
         reftypes: false,
         remat: false,
         callsite_ish_constraints: false,
+        critical_edges: false,
         num_blocks: 1..=100,
         num_vregs_per_block: 5..=15,
         num_uses_per_inst: 0..=10,
@@ -446,10 +450,11 @@ impl Func {
         // fork linking to the next and the right fork in `out_blocks`
         // to be connected below. This creates an arbitrary CFG with
         // split critical edges, which is a property that we require
-        // for the regalloc.
+        // for the regalloc, unless `opts.critical_edges`.
         let mut from = 0;
         let mut out_blocks = vec![];
         let mut in_blocks = vec![];
+        let mut forks = vec![];
         while from < num_blocks {
             in_blocks.push(from);
             if num_blocks > 3 && from < num_blocks - 3 && bool::arbitrary(u)? {
@@ -460,6 +465,7 @@ impl Func {
                 builder.add_edge(Block::new(from), Block::new(from + 2));
                 builder.add_edge(Block::new(from + 2), Block::new(from + 3));
                 out_blocks.push(from + 1);
+                forks.push(from);
                 from += 2;
             } else if from < num_blocks - 1 {
                 builder.add_edge(Block::new(from), Block::new(from + 1));
@@ -469,6 +475,17 @@ impl Func {
         for pred in out_blocks {
             let succ = *u.choose(&in_blocks[..])?;
             builder.add_edge(Block::new(pred), Block::new(succ));
+        }
+        if opts.critical_edges {
+            // A fork's extra edge goes to a block that already has a
+            // predecessor, so it is critical. It may even go to one of the
+            // fork's own successors, making two edges to the same block.
+            for fork in forks {
+                if bool::arbitrary(u)? {
+                    let succ = *u.choose(&in_blocks[..])?;
+                    builder.add_edge(Block::new(fork), Block::new(succ));
+                }
+            }
         }
         builder.compute_doms();
 
@@ -684,7 +701,21 @@ impl Func {
                     params.push(args);
                 }
                 builder.set_block_params_out(Block::new(block), params);
-                builder.add_inst(Block::new(block), InstData::branch());
+                let mut branch = InstData::branch();
+                if opts.critical_edges && !avail.is_empty() && bool::arbitrary(u)? {
+                    // A branch that reads a value, as a conditional branch
+                    // reads its condition, leaves no room for an edge's moves
+                    // ahead of it.
+                    for _ in 0..u.int_in_range(1..=2)? {
+                        branch.operands.push(Operand::new(
+                            *u.choose(&avail[..])?,
+                            OperandConstraint::Any,
+                            OperandKind::Use,
+                            OperandPos::Early,
+                        ));
+                    }
+                }
+                builder.add_inst(Block::new(block), branch);
             } else {
                 builder.add_inst(Block::new(block), InstData::ret());
             }
