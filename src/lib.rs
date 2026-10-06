@@ -1334,6 +1334,17 @@ pub trait Function {
     /// register it then picks. Only [`Algorithm::Regicide`] consults this; the
     /// default, [`None`], is always safe.
     ///
+    /// The cost says when recomputing beats the alternative:
+    ///
+    /// * [`RematCost::AlwaysRemat`]: recompute at every use rather than keep
+    ///   the value live, because re-executing the definition costs no more
+    ///   than a register-to-register [`Edit::Move`];
+    /// * [`RematCost::CheaperThanMove`]: recompute rather than copy the value
+    ///   between registers, but keep it live where that is free;
+    /// * [`RematCost::CheaperThanReload`]: recompute rather than reload the
+    ///   value from a spill slot, but copy it between registers when it is
+    ///   already in one.
+    ///
     /// # Which vregs may answer `Some`
     ///
     /// The allocator validates these, and breaking one fails the whole

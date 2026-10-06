@@ -1658,7 +1658,7 @@ mod tests {
         /// Each class's spill-slot size; `None` for a class that panics when
         /// asked.
         spillslot_size: [Option<usize>; NUM_CLASSES],
-        remat: Vec<VReg>,
+        remat: Vec<(VReg, rgc::RematCost)>,
     }
 
     impl Probe {
@@ -1692,8 +1692,8 @@ mod tests {
             self
         }
 
-        fn rematerializable(mut self, vregs: &[VReg]) -> Self {
-            self.remat.extend_from_slice(vregs);
+        fn rematerializable(mut self, vregs: &[VReg], cost: rgc::RematCost) -> Self {
+            self.remat.extend(vregs.iter().map(|&v| (v, cost)));
             self
         }
 
@@ -1750,8 +1750,9 @@ mod tests {
         }
         fn is_rematerializable(&self, vreg: VReg) -> Option<rgc::RematCost> {
             self.remat
-                .contains(&vreg)
-                .then_some(rgc::RematCost::AlwaysRemat)
+                .iter()
+                .find(|(v, _)| *v == vreg)
+                .map(|(_, cost)| *cost)
         }
         fn spillslot_size(&self, class: RegClass) -> usize {
             self.spillslot_size[class as usize].unwrap_or_else(|| {
@@ -2238,7 +2239,7 @@ mod tests {
         insts.push(use_(remat));
         insts.push(vec![]);
 
-        let func = Probe::new(insts).rematerializable(&[remat]);
+        let func = Probe::new(insts).rematerializable(&[remat], rgc::RematCost::AlwaysRemat);
         let output = alloc(&func, &env);
 
         let remats: Vec<_> = output
@@ -2273,6 +2274,80 @@ mod tests {
             output.num_spillslots, 0,
             "a value that can be recomputed should not need a spill slot",
         );
+    }
+
+    /// Allocate a value read in two different fixed registers, so it must be
+    /// copied or recomputed, and return its remats and register moves.
+    fn remats_and_moves_of_a_value_in_two_regs(
+        cost: rgc::RematCost,
+    ) -> (Vec<(VReg, Allocation)>, Vec<(Allocation, Allocation)>) {
+        let env = env_with_scratch([None; NUM_CLASSES]);
+        let v = VReg::new(0, RegClass::Int);
+        let use_in = |hw_enc| {
+            vec![Operand::new(
+                v,
+                OperandConstraint::FixedReg(PReg::new(hw_enc, RegClass::Int)),
+                OperandKind::Use,
+                OperandPos::Early,
+            )]
+        };
+        let insts = vec![
+            vec![Operand::new(
+                v,
+                OperandConstraint::Reg,
+                OperandKind::Def,
+                OperandPos::Late,
+            )],
+            use_in(0),
+            use_in(1),
+            vec![],
+        ];
+
+        let func = Probe::new(insts).rematerializable(&[v], cost);
+        let output = alloc(&func, &env);
+
+        let mut remats = vec![];
+        let mut moves = vec![];
+        for (_, edit) in &output.edits {
+            match *edit {
+                Edit::Remat { vreg, to } => remats.push((vreg, to)),
+                Edit::Move { from, to } if from.is_reg() && to.is_reg() => moves.push((from, to)),
+                Edit::Move { .. } => {}
+            }
+        }
+        (remats, moves)
+    }
+
+    /// A value whose recomputation costs no more than a move is recomputed
+    /// into each register that needs it.
+    #[test]
+    fn an_always_remat_value_is_recomputed_rather_than_moved() {
+        let (remats, moves) = remats_and_moves_of_a_value_in_two_regs(rgc::RematCost::AlwaysRemat);
+        assert!(
+            !remats.is_empty(),
+            "nothing was rematerialized; moves were {:?}",
+            moves,
+        );
+        assert!(
+            moves.is_empty(),
+            "an `AlwaysRemat` value should be recomputed, not moved: {:?}",
+            moves,
+        );
+    }
+
+    /// A value only cheaper to recompute than to reload is moved between
+    /// registers instead.
+    #[test]
+    fn a_cheaper_than_reload_value_is_moved_rather_than_recomputed() {
+        let (remats, moves) =
+            remats_and_moves_of_a_value_in_two_regs(rgc::RematCost::CheaperThanReload);
+        assert!(
+            remats.is_empty(),
+            "a `CheaperThanReload` value already in a register should be \
+             moved, not recomputed: {:?}",
+            remats,
+        );
+        assert!(!moves.is_empty(), "the value was never moved");
     }
 
     /// A value only a cold block reads loses the register to one a normal
