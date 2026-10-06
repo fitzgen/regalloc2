@@ -59,18 +59,20 @@ A cheap three-step that avoids both:
     benchmarks/shootout/shootout-keccak.wasm \
     > $R/sightglass-data/confirm-cycles.csv
 
-# 3. Whole suite, also in the background. The authority for ranking and for any
-#    suite-wide claim, but ~70 minutes on pca.suite — nothing should wait on it.
-./scripts/sightglass > $R/sightglass-data/screen-insts-retired.csv
+# 3. The suite minus its host-bound modules, also in the background. The
+#    authority for ranking; its wall clock is dominated by slow regicide
+#    compiles (see "Compile time decides what you can measure").
+./scripts/sightglass -i 5 $(sed 's|^|benchmarks/|' $R/sightglass-data/screen.suite) \
+    > $R/sightglass-data/screen-insts-retired.csv   # screen.suite: SKILL.md §2
 ```
 
-Observed agreement between (1) and (3): `shootout-sieve` came back at **-2.23%
-in both**, `shootout-keccak` at -11.00% / -11.06%. A cheap subset screen is a
+Observed agreement between (1) and (3): `shootout-sieve` came back at **+2.23%
+in both**, `shootout-keccak` at +11.00% / +11.06%. A cheap subset screen is a
 good substitute for picking targets.
 
 One exception worth knowing: a benchmark can be *significant* in a `-i 5` subset
 run and *insignificant* in the `-i 3` full screen, purely on sample count —
-`shootout-heapsort` was -15.06% significant in one and -12.72% not significant
+`shootout-heapsort` was +15.06% significant in one and +12.72% not significant
 in the other. Take the higher-sample number, and note that the low-power run
 *understated* a real regression rather than inventing one.
 
@@ -86,34 +88,43 @@ pointed straight at every real mechanism in the last full run. It is a **bad
 cost estimator** for a register allocator, because the difference is usually
 register-register moves, which is precisely its blind spot.
 
-What one session actually measured:
+What one session (001) actually measured, with what 002 measured five days
+later in brackets:
 
 | benchmark | insts-retired | cycles | |
 | --- | ---: | ---: | --- |
-| `shootout-switch` | -237.23% | **-53.39%** | significant — a 1.53x slowdown |
-| `shootout-heapsort` | -15.06% | **-1.15%** | not significant — ~10x smaller |
-| `shootout-keccak` | -11.00% | **-1.15%** | not significant |
-| `shootout-sieve` | -2.23% | **+7.38%** | significant — **a win** |
+| `shootout-switch` | +237.23% | **+53.39%** [+48.93%] | significant — a 1.5x slowdown |
+| `shootout-heapsort` | +15.06% | **+1.15%** [-0.27%] | not significant — ~10x smaller |
+| `shootout-keccak` | +11.00% | **+1.15%** [-1.27%] | not significant |
+| `shootout-sieve` | +2.23% | **-7.38%** [-1.39%, n.s.] | significant — **a win**, until it wasn't |
+| `sqlite3` (002 only) | +21.80% | [+2.27%, n.s.] | ~10x smaller again |
 
 Three things follow, and each cost rework to learn:
 
-1. **A benchmark filed as a regression was a win.** `shootout-sieve`'s hot
-   function emits 37 *more* moves than ion's with identical stack traffic, and
-   runs ~6% faster. Move-only regressions of that size are not where the cost
-   is.
+1. **A benchmark filed as a regression was a win — and then, five days later,
+   was not.** `shootout-sieve`'s hot function emitted 37 *more* moves than
+   ion's with identical stack traffic and measured ~6% faster (001). After an
+   unrelated change removed some moves *ahead of* its innermost loop, the win
+   shrank to -1.39%, not significant (002) — the loop itself was identical to
+   ion's in every build, but had moved across a 64-byte boundary. Lesson: a
+   cycles difference in a benchmark whose hot loop matches ion's instruction
+   for instruction is probably layout. Check before attributing it to the
+   allocator.
 2. **The overstatement factor varies**, so you cannot apply a correction: ~10x
-   on the small benchmarks, ~4.4x on the one with real fan-out.
+   on the small benchmarks and sqlite3, ~4–5x on `shootout-switch`, where
+   fan-out multiplied the moves.
 3. **"Excess moves are cheap" is a conclusion reachable from an
-   unrepresentative sample.** The same mechanism that cost ~1% at a loop exit
-   cost 53% of wall-clock time on `shootout-switch`, where jump-table fan-out
-   multiplied it ~4,000 times and produced 5.2x the code. The honest finding is
-   **cheap per occurrence, severe where the code shape multiplies it** — and you
-   cannot tell which case you are in from instruction counts.
+   unrepresentative sample.** Moves that cost ~1% at heapsort's loop exits
+   cost ~50% of wall-clock time on `shootout-switch`, where jump-table fan-out
+   multiplied a register rotation ~4,000 times and produced 5.2x the code (a
+   different cause, but the same currency). The honest finding is **cheap per
+   occurrence, severe where the code shape multiplies it** — and you cannot
+   tell which case you are in from instruction counts.
 
 So: write the mechanism up as soon as you have it, with event-log and
-disassembly evidence. Leave the severity sentence until cycles lands. The
-mechanism findings in that session survived both metrics untouched; every
-magnitude moved.
+disassembly evidence. Leave the severity sentence until cycles lands. In 001
+every magnitude moved, and one mechanism (switch's) later proved wrong: derive
+mechanisms from the event log, not by analogy.
 
 ### Check robustness before believing any cycles result
 
@@ -127,7 +138,7 @@ for r in csv.DictReader(open(csvfile)):
     d[r['engine']].append(int(r['count']))
 bt, rg = sorted(d['backtracking']), sorted(d['regicide'])
 k = len(bt) // 5
-f = lambda a, c: 100 * (a - c) / a
+f = lambda a, c: 100 * (c - a) / a   # negative => regicide faster
 print("mean       ", f(st.mean(bt), st.mean(rg)))
 print("median     ", f(st.median(bt), st.median(rg)))
 print("20%-trimmed", f(st.mean(bt[:-k]), st.mean(rg[:-k])))
@@ -137,12 +148,13 @@ print("CV%        ", 100*st.stdev(bt)/st.mean(bt), 100*st.stdev(rg)/st.mean(rg))
 
 This is what distinguished the real results from the noise in that session:
 
-- `shootout-switch` -53.39%: held at every estimator down to **-36.64%**
+- `shootout-switch` +53.39%: held at every estimator down to **+36.64%**
   minimum-to-minimum, and backtracking's *slowest* sample beat regicide's
   *median*. Believable.
-- `shootout-sieve` +7.38%: held at median +5.43%, trimmed +5.61%, minimum
-  +6.08%. Believable.
-- `hashset` -7.02%: **1.8x spread inside one engine's own 30 samples** (CV
+- `shootout-sieve` -7.38%: held at median -5.43%, trimmed -5.61%, minimum
+  -6.08%. Believable *as a measurement* — but it did not survive an unrelated
+  code-layout change (see above). Robust is not the same as attributable.
+- `hashset` +7.02%: **1.8x spread inside one engine's own 30 samples** (CV
   13.9%). Not a result; reported as noise.
 
 Quote the minimum-to-minimum figure when a result matters — it is the most
@@ -209,12 +221,17 @@ Drop `-o csv` for a human-readable comparison, which prints one block per
 
 ### 1. Direction
 
-These are **counts**, so **lower is faster**. A positive delta in
-`rank_benchmarks.py` means the candidate (regicide) is *faster*, because it
-reports `(baseline - candidate) / baseline`. But reading the raw
-`effect-size` CSV, check which engine landed in `a_engine` before calling
-anything a win — `effect-size` emits each pair once, in an order it chooses.
-Getting this backwards inverts the entire report.
+These are **counts**, so **lower is faster**. `rank_benchmarks.py` reports
+`(candidate - baseline) / baseline`, so a **negative** delta means the
+candidate (regicide) is *faster* and a positive one means it is slower — the
+house convention for every report (SKILL.md, "Sign convention"). But reading
+the raw `effect-size` CSV, check which engine landed in `a_engine` before
+calling anything a win — `effect-size` emits each pair once, in an order it
+chooses. Getting this backwards inverts the entire report.
+
+**Analysis 001's report files use the opposite sign** (positive = faster).
+The numbers quoted from it in this skill have been converted; the files in
+`reports/codegen-analysis-001/` have not.
 
 ### 2. Significance
 
@@ -250,15 +267,15 @@ This is not a theoretical nuance on this suite. Measured:
 
 | | `insts-retired` |
 | --- | ---: |
-| `Sum Total` | **-0.84%** (significant) |
-| per-benchmark geomean | **-20.10%** |
+| `Sum Total` | **+0.84%** (significant) |
+| per-benchmark geomean | **+20.10%** |
 | benchmarks significantly slower | **12 of 17** |
 | benchmarks significantly faster | **0** |
 
 `Sum Total` understates the regression by roughly **24x**, because 97.8% of the
 suite's instruction count is in three benchmarks that are host-GC-bound,
-host-memcpy-bound, or unprofilable — and which duly came back at +0.00%, -0.26%
-and -0.37%. `Sum Total` is substantially a measurement of Wasmtime's runtime,
+host-memcpy-bound, or unprofilable — and which duly came back at +0.00%, +0.26%
+and +0.37%. `Sum Total` is substantially a measurement of Wasmtime's runtime,
 not of either allocator. See §4 of `SKILL.md`.
 
 **So: never quote `Sum Total` as the result, and never compute a cost-weighted
@@ -326,7 +343,9 @@ measurement you care about. Stop the lower-value job.
 ## The per-benchmark regression gate
 
 When you want a pass/fail answer rather than a ranking, the sibling skill's gate
-script works unchanged on regicide data:
+script works on regicide data — **but it prints deltas in the opposite sign
+convention** (`(baseline - candidate) / baseline`, positive = faster). Negate
+any number you copy from it into a report:
 
 ```bash
 python3 ~/.claude/skills/optimize-cranelift-codegen/scripts/check_no_pessimization.py \
@@ -341,6 +360,18 @@ a failure, so the exit code is informational. `rank_benchmarks.py` is the better
 tool for choosing what to analyze.
 
 ---
+
+## Compile time decides what you can measure
+
+Sightglass compiles the module once per measured process. A module regicide
+compiles slowly multiplies straight into the run: in 002, tinygo-regex took
+regicide ~40 minutes per compile, so a `-i 5` screen (2 processes) spent ~80
+minutes on it alone and a `-i 30` cycles run would have taken ~7 hours. Know
+each module's regicide compile time (from the §1/§4 disassembly) before
+choosing which modules go into which run, and keep the slow ones separate.
+For a module too slow to measure on cycles, the profile from its `.cwasm`
+(guest samples per run) is the fallback — label it as a profile, not a
+measurement.
 
 ## Bookkeeping
 

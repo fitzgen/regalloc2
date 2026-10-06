@@ -24,8 +24,10 @@ Input columns (the `effect-size -o csv` schema):
     b_mean,significance_level,half_width_confidence_interval
 
 Counts are cycles / instructions, so LOWER IS FASTER. Deltas are reported as
-(baseline - candidate) / baseline * 100, i.e. POSITIVE means the candidate
-(regicide, by default) is FASTER.
+(candidate - baseline) / baseline * 100, i.e. the change in cost the candidate
+(regicide, by default) brings: NEGATIVE means FASTER (-12% shaved 12% off the
+baseline), POSITIVE means SLOWER (+5% ran 5% more). This is the house
+convention for every report file; see SKILL.md, "Sign convention".
 
 Usage:
     rank_benchmarks.py ES.csv [--top N] [--baseline LABEL] [--candidate LABEL]
@@ -64,21 +66,35 @@ DEFAULT_BASELINE = "backtracking"
 DEFAULT_CANDIDATE = "regicide"
 
 
-def bench_label(wasm):
-    """Reduce './benchmarks/bz2/benchmark.wasm' to 'bz2/benchmark'."""
+def strip_to_benchmarks(wasm):
+    """Reduce a sightglass module path to the part under `benchmarks/`.
+
+    Sightglass records either a relative path (`./benchmarks/bz2/x.wasm`) or an
+    absolute one (`/home/me/sightglass/benchmarks/bz2/x.wasm`), depending on
+    how it was invoked.
+    """
     name = wasm
-    for prefix in ("./benchmarks/", "benchmarks/"):
+    marker = "benchmarks/"
+    i = name.rfind("/" + marker)
+    if i >= 0:
+        return name[i + 1 + len(marker) :]
+    for prefix in ("./" + marker, marker):
         if name.startswith(prefix):
-            name = name[len(prefix) :]
+            return name[len(prefix) :]
+    return name
+
+
+def bench_label(wasm):
+    """Reduce '.../benchmarks/bz2/benchmark.wasm' to 'bz2/benchmark'."""
+    name = strip_to_benchmarks(wasm)
     return name[: -len(".wasm")] if name.endswith(".wasm") else name
 
 
 def wasm_path(wasm):
     """The path to pass back to `scripts/sightglass`, relative to sightglass."""
-    name = wasm
-    if name.startswith("./"):
-        name = name[2:]
-    return name if name.startswith("benchmarks/") else f"benchmarks/{name}"
+    if wasm == SUM_TOTAL:
+        return wasm
+    return "benchmarks/" + strip_to_benchmarks(wasm)
 
 
 def load(path):
@@ -159,7 +175,7 @@ def collect(rows, base, cand, flipped):
         base_mean = float(row["a_mean" if not flipped else "b_mean"])
         cand_mean = float(row["b_mean" if not flipped else "a_mean"])
         half_width = abs(float(row["half_width_confidence_interval"]))
-        diff = base_mean - cand_mean
+        diff = cand_mean - base_mean
 
         groups[(row["phase"], row["event"])].append(
             {
@@ -167,7 +183,7 @@ def collect(rows, base, cand, flipped):
                 "path": wasm_path(row["wasm"]),
                 "base": base_mean,
                 "cand": cand_mean,
-                # Positive => candidate is faster (fewer cycles/instructions).
+                # Negative => candidate is faster (fewer cycles/instructions).
                 "delta_pct": (diff / base_mean * 100.0) if base_mean else 0.0,
                 "significant": abs(diff) > half_width,
             }
@@ -176,7 +192,7 @@ def collect(rows, base, cand, flipped):
 
 
 def geomean_ratio(entries):
-    """Geometric mean of candidate/baseline, as a percentage delta.
+    """Geometric mean of candidate/baseline, as a percentage change in cost.
 
     A geometric mean is the right average for ratios, and the suite spans
     benchmarks whose counts differ by four orders of magnitude, so an arithmetic
@@ -189,8 +205,8 @@ def geomean_ratio(entries):
     if not ratios:
         return None
     gm = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-    # Report as a speedup percentage, matching the per-benchmark delta's sign.
-    return (1.0 - gm) * 100.0
+    # Same sign as the per-benchmark delta: negative => candidate faster.
+    return (gm - 1.0) * 100.0
 
 
 def report(group, entries, top, show_all):
@@ -203,17 +219,18 @@ def report(group, entries, top, show_all):
         print("  (no per-benchmark rows)")
         return
 
-    # Worst regression first: that is the end of the list the analysis is for.
-    benches.sort(key=lambda e: e["delta_pct"])
+    # Worst regression (most positive) first: that is the end of the list the
+    # analysis is for.
+    benches.sort(key=lambda e: -e["delta_pct"])
 
     sig = [e for e in benches if e["significant"]]
-    regressed = [e for e in sig if e["delta_pct"] < 0]
-    improved = [e for e in sig if e["delta_pct"] > 0]
+    regressed = [e for e in sig if e["delta_pct"] > 0]
+    improved = [e for e in sig if e["delta_pct"] < 0]
 
     gm = geomean_ratio(benches)
     print(f"  benchmarks           {len(benches)}")
     if gm is not None:
-        print(f"  geomean              {gm:+.2f}%  (positive => candidate faster)")
+        print(f"  geomean              {gm:+.2f}%  (negative => candidate faster)")
     print(f"  significantly faster {len(improved)}")
     print(f"  significantly slower {len(regressed)}")
     print(f"  no difference        {len(benches) - len(sig)}")
@@ -247,8 +264,8 @@ def report(group, entries, top, show_all):
     pool = sig if sig else benches
     qualifier = "" if sig else "  (NOT significant -- ranking only, treat as a guess)"
 
-    worst = [e for e in pool if e["delta_pct"] < 0][:top]
-    best = [e for e in reversed(pool) if e["delta_pct"] > 0][:top]
+    worst = [e for e in pool if e["delta_pct"] > 0][:top]
+    best = [e for e in reversed(pool) if e["delta_pct"] < 0][:top]
 
     print(f"\n  top {top} regressed by the candidate{qualifier}:")
     for e in worst or [None]:
@@ -313,7 +330,8 @@ def main():
     print(f"candidate = {cand}")
     print(
         "\nCounts are cycles/instructions, so LOWER IS FASTER; delta % is\n"
-        "(baseline - candidate) / baseline * 100, so POSITIVE => candidate is FASTER.\n"
+        "(candidate - baseline) / baseline * 100, so NEGATIVE => candidate is FASTER\n"
+        "(-12% = 12% less than the baseline) and POSITIVE => SLOWER.\n"
         "'sig' is sightglass's own test: |a_mean - b_mean| > |half-width CI|."
     )
 

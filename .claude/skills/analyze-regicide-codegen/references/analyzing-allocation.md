@@ -161,15 +161,17 @@ are worse here" is not.
 **Check `references/known-findings.md` first.** Previous runs have already
 established several of these mechanisms with event-log evidence, and have ruled
 some explanations out — splits do *not* lose register hints, move elimination is
-*not* a limiter, and remat-vs-reload is *not* even available under Wasmtime.
+*not* a limiter. (Remat-vs-reload *is* available under Wasmtime since
+`00a6476`, for constants only — 001's note that it was not is stale.)
 Starting there means a level-3 explanation either confirms a known mechanism on
 new code or finds a genuinely new one, rather than re-deriving.
 
 **And before proposing a fix, grep for it.** One previous run recommended adding
 cross-region register hinting; `hint_across_regions` had been there all along,
-and the actual finding was a level deeper — the hints are built and then
-discarded. A recommendation to add something that exists is worse than no
-recommendation.
+and the actual finding was a level deeper — in 001, the hints were mostly not
+honored at assignment (since fixed; known-findings §1). A recommendation to add
+something that exists is worse than no recommendation. Check the user's
+in-flight branches too (`git branch -a`, read-only).
 
 Reading the source is in scope and often the fastest route — just don't change
 it.
@@ -264,13 +266,18 @@ setup. Quote the narrow number in a report, and say which you used.
 Two follow-ups from the same parse, both of which paid off:
 
 - **Distinct branch targets per function.** `shootout-switch` had 33 under
-  backtracking and 1,038 under regicide, which is what revealed ~1,000
-  materialized edge blocks and explained the whole regression.
+  backtracking and 1,038 under regicide, which revealed ~1,000 materialized
+  edge blocks — where the regression *lives*. Why it is there took the event
+  log (known-findings §2).
 - **Runs of consecutive register-register moves.** A *permutation* (`x4<-x5`,
-  `x5<-x8`, `x8<-x11`, …) is the signature of two adjacent regions choosing
+  `x5<-x8`, `x8<-x11`, …) is the signature of two allocation units choosing
   different registers for the same live values, reconciled on the edge between
   them — quite different from a few independent copies. Counting runs of >= 4
   found 3,992 of them, median length 19, holding 99.9% of one function's moves.
+  **A permutation tells you *that* two sides disagree, not why.** In switch the
+  two sides were in the *same* region and the cause was refused coalescing
+  (`MAX_MERGE_SPANS`); in tinygo-regex it was split peeling. 001 read it as a
+  region boundary and was wrong. Go to the event counts (SKILL.md §5) next.
 
 ### Check whether the function even has loops
 

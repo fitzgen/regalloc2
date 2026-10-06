@@ -68,9 +68,10 @@ Two scripts in this skill consume that file:
   as `.wasm` paths ready to paste into a confirmation run. This is the one you
   want for picking what to analyze.
 - `~/.claude/skills/optimize-cranelift-codegen/scripts/check_no_pessimization.py`
-  — the sibling skill's per-benchmark regression gate. It works unchanged on
-  regicide data; pass `--baseline backtracking --candidate regicide`. Useful
-  when you want a pass/fail answer rather than a ranking.
+  — the sibling skill's per-benchmark regression gate. It works on regicide
+  data; pass `--baseline backtracking --candidate regicide`. Useful when you
+  want a pass/fail answer rather than a ranking. **Its deltas use the opposite
+  sign (positive = faster)**; negate them before quoting.
 
 ---
 
@@ -103,6 +104,49 @@ async runtime — asleep, not working. The guest's own frames are under
 Built with the `profiling` cargo profile (optimized, with line tables) and run
 with `--profile=perfmap`, so the JIT-compiled Wasm frames symbolicate instead of
 coming back as bare offsets.
+
+### Profiling an existing `.cwasm`
+
+`scripts/profile` recompiles the module every time. When regicide takes tens
+of minutes to compile it (tinygo-regex: 40 minutes; sqlite3: 10), profile the
+`.cwasm` that `scripts/disassemble` already wrote, with the release
+`wasmtime`. samply cannot inject into the system-signed `/bin/sh`, so the
+re-run loop must be a compiled binary:
+
+```rust
+// /tmp/loopdrv.rs -- rustc -O -o /tmp/loopdrv /tmp/loopdrv.rs
+use std::{env, process::{Command, Stdio}, time::{Duration, Instant}};
+fn main() {
+    let mut a = env::args().skip(1);
+    let secs: u64 = a.next().unwrap().parse().unwrap();
+    let argv: Vec<String> = a.collect();
+    let (start, mut runs) = (Instant::now(), 0);
+    while start.elapsed() < Duration::from_secs(secs) {
+        let s = Command::new(&argv[0]).args(&argv[1..]).stdout(Stdio::null()).status().unwrap();
+        runs += 1;
+        if !s.success() { std::process::exit(1); }
+    }
+    eprintln!("loop-driver: {runs} runs");
+}
+```
+
+```bash
+cd ~/sightglass/benchmarks/<dir>      # benchmarks read inputs by relative path
+samply-text record -t -n 250 -- /tmp/loopdrv 15 \
+    ~/regalloc2/wasmtime/target/release/wasmtime run --profile=perfmap \
+    --allow-precompiled -W unknown-imports-default -S cli --dir .::. \
+    $R/profiles/asm/<bench>-<alloc>.cwasm > $R/profiles/<bench>-<alloc>.txt
+```
+
+The two allocators complete different numbers of runs in the same window, so
+compare **guest samples per run** (`array_to_wasm_trampoline` total ÷
+`loop-driver: N runs`), not raw samples. Guest frames symbolize via the
+perfmap even without line tables. A copy of both files is in
+`reports/codegen-analysis-002/misc/tools/`.
+
+**Do not try to get per-address heat from samply's raw JSON.** The `address`
+recorded for a perfmap JIT frame is offset from the real address by a constant
+that varies per function and per run; block attributions from it are wrong.
 
 ### Running a sightglass benchmark standalone
 
@@ -198,8 +242,15 @@ sites it has:
 | `regicide::redundant_move_elimination` | 1 | Why was a move kept rather than removed? |
 | `regicide::dead_move_elimination` | 1 | Same, for dead moves. |
 
-Two caveats:
+Caveats:
 
+- **`SpanConstructed` span IDs are provisional in the text log.** They are
+  emitted before the block's spans are sorted; only the in-memory event log is
+  remapped, under the `visualizer` feature. Span → block is correct; span →
+  value is permuted within each block. Joining later events
+  (`SpansCoalesced`, `CoalesceRefused`) to values through `SpanConstructed`
+  gives nonsense (in 002: "92,174 `CrossEdge` merges between different
+  values"). Use the visualizer's JSON when you need the value.
 - `regicide::liveness` emits nothing — liveness results surface through
   `live_ranges`. Filtering on it gets you silence.
 - `region_allocation`'s own submodules (`assignments`, `splitting`) emit no
@@ -301,10 +352,12 @@ ls $R/corpus | grep -i <function-name>
 
 **This only works for modules with a name section.** Most sightglass benchmarks
 are stripped, so captures come out as `benchmark-0004-u0-3.postcard` — `u0-3`
-is Wasmtime's placeholder for module 0, function 3, not a symbol. For those,
-match by function *index* against the disassembly, or identify the function you
-want by its counts (the hot function is usually the one with by far the most
-moves or spills):
+is Wasmtime's placeholder for module 0, *defined* function 3, not a symbol.
+The disassembly's `function[M]` counts imports too, so for a module with `k`
+function imports, `function[M]` is `u0-(M-k)` (tinygo-regex: 15; sqlite3:
+10). Count them with `grep '(import' x.wat | grep -c '(func'`. Or identify the
+function you want by its counts (the hot function is usually the one with by
+far the most moves or spills):
 
 ```bash
 cargo run --manifest-path regicide/Cargo.toml --all-features --example run \
@@ -364,6 +417,27 @@ between allocators — it cannot be one.
 
 A function needing more registers at once than the machine has is reported as
 `skipped`, which is a property of the input rather than a bug.
+
+**Some single functions take minutes to replay** (tinygo `countMatches`: 471 s;
+sqlite3's VDBE loop: 502 s) — the split-peel loop in known-findings §3. Run
+those in the background, and replay a corpus per function with a timeout
+(`timeout 60 run -q one.postcard`) rather than as one directory, so one slow
+function does not hide the rest.
+
+### Rendering one visualization from a corpus input
+
+`scripts/visualize` recompiles the module. When you already have the corpus
+input, render directly:
+
+```bash
+cargo build --manifest-path regicide/Cargo.toml --release --example visualize \
+    --features visualizer,test-utils,deserialize
+regicide/target/release/examples/visualize --input $R/corpus-X/<fn>.postcard \
+    $R/viz/<bench>/<fn>.html
+```
+
+Pages for huge functions can be enormous (switch's hot function: 190 MB) —
+note the size in the report.
 
 Add `RUST_LOG=trace` for regicide's event log on the replay — the same
 information `scripts/log` gives you, without compiling any Wasm:

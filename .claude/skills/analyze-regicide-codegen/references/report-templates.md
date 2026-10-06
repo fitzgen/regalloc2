@@ -24,18 +24,19 @@ This is the file the user actually reads. Everything else is evidence for it.
 N = 5
 
 regicide (candidate) vs regalloc2 backtracking/ion (baseline). Counts are
-instructions or cycles, so lower is faster; a positive delta means regicide is
-faster.
+instructions or cycles, so lower is faster. Deltas are (regicide - ion) / ion:
+**negative means regicide is faster** (-12% = 12% fewer), positive means
+slower.
 
 ## Top line
 
 | | insts-retired | cycles |
 | --- | --- | --- |
-| geomean | +0.54% | inconclusive |
+| geomean | -0.54% | inconclusive |
 | significantly faster | 4 | 1 |
 | significantly slower | 3 | 0 |
 | no difference | 34 | 40 |
-| `Sum Total` | +0.79% (significant) | +0.3% (not significant) |
+| `Sum Total` | -0.79% (significant) | -0.3% (not significant) |
 
 Ranking is by `insts-retired`, which resolves; cycles was run at `-i 30` on the
 ten benchmarks below and resolved only `hashset`. <!-- Say this plainly rather
@@ -68,10 +69,10 @@ Largest slowdown first.
 
 | benchmark | insts-retired | cycles | analyzed |
 | --- | --- | --- | --- |
-| `blake3-scalar/benchmark` | -10.93% | n.s. | [regressions/blake3-scalar.md](regressions/blake3-scalar.md) |
-| `quicksort/benchmark` | -6.13% | n.s. | [regressions/quicksort.md](regressions/quicksort.md) |
+| `blake3-scalar/benchmark` | +10.93% | n.s. | [regressions/blake3-scalar.md](regressions/blake3-scalar.md) |
+| `quicksort/benchmark` | +6.13% | n.s. | [regressions/quicksort.md](regressions/quicksort.md) |
 | … | | | |
-| `hashset/benchmark` | +12.06% | +9.1% | [improvements/hashset.md](improvements/hashset.md) |
+| `hashset/benchmark` | -12.06% | -9.1% | [improvements/hashset.md](improvements/hashset.md) |
 
 ## Top 5 things to fix
 
@@ -102,7 +103,7 @@ Wins get recorded precisely because the next change can silently undo them.
   leaves it in the body.
 - **Why it works:** <!-- the mechanism, so a future change can be checked
   against it -->
-- **Seen in:** `hashset` (+12.06%, hottest block), `bz2` (block 7).
+- **Seen in:** `hashset` (-12.06%, hottest block), `bz2` (block 7).
 - **How a change could break it:** <!-- what to watch for -->
 - **Evidence:** [improvements/hashset.md](improvements/hashset.md) §Block 2.
 
@@ -121,30 +122,34 @@ Wins get recorded precisely because the next change can silently undo them.
 
 One per benchmark, same shape for both directions.
 
-Two rules specific to these files:
+Three rules specific to these files:
 
 1. **Name both metrics in the title when they disagree**, e.g.
-   `-2.23% instructions but +7.38% cycles`. A title quoting only the
+   `+2.23% instructions but -7.38% cycles`. A title quoting only the
    instruction delta misdescribes the benchmark.
 2. **If the `cycles` row is still pending, the prose must not characterize
    severity.** Write the mechanism — what differs, why the allocator did it,
    what in its design led there — and leave the "how bad is it" sentence until
    cycles lands. In one session three per-benchmark reports had to be revised
    because severity was written from instruction counts.
+3. **Every delta uses the sign convention** (SKILL.md): `(variant - baseline)
+   / baseline`, negative = faster. When a table compares two runs or two
+   regicide revisions rather than ion vs regicide, name the baseline in the
+   column header (e.g. `moves, 630ca5e → 2a56dbe`).
 
 A benchmark can also belong in `regressions/` by instruction count while being
 a *win* on cycles. Keep it where the ranking put it, and say so plainly at the
 top rather than silently filing it under the other direction.
 
-```markdown
-# <benchmark> — regicide <+12.06% / -10.93%>
+````markdown
+# <benchmark> — regicide <-12.06% / +10.93%>
 
 **2026-09-30, 15:04**
 
 | metric | backtracking | regicide | delta | significant |
 | --- | --- | --- | --- | --- |
-| insts-retired | 900,271 | 791,710 | +12.06% | yes |
-| cycles (`-i 30`) | 412,003 | 374,551 | +9.1% | yes |
+| insts-retired | 900,271 | 791,710 | -12.06% | yes |
+| cycles (`-i 30`) | 412,003 | 374,551 | -9.1% | yes |
 
 <!-- When cycles resolved and disagrees in direction or magnitude, say so here
      in a sentence, with the robust estimators (median / trimmed / minimum) so
@@ -269,7 +274,7 @@ the heuristic -->
 ### 2. `<function>` — 18% of samples
 
 …
-```
+````
 
 ---
 
