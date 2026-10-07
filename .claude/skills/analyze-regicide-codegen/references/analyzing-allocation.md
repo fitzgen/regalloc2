@@ -53,6 +53,12 @@ look like:
 - **Coalescing was refused** — the two spans conflicted, or wanted disjoint
   locations — so the copy survived.
 - **Spill placement** chose this point rather than a cheaper one.
+- **Spill-slot assignment** gave two values joined by a move (a block
+  parameter and its argument) different slots, so the move is a stack-to-stack
+  copy. `spill_slot_allocation.rs` colors per value; see known-findings §8.
+- A **callee-saved register** was taken by a value that did not need one
+  (save/restore per call), or not given to one that did (reload after every
+  call). Regicide has no cost model for either; known-findings §9.
 - A **fixed-register constraint** (a call's ABI registers, a reused operand)
   forced the assignment, and everything else moved around it.
 - The value was **rematerialized** instead of reloaded, or vice versa.
@@ -229,39 +235,24 @@ and register-register moves. Sort by the delta that interests you. On a
 regression in seconds — it took one pass to attribute `shootout-switch`'s
 81,610 surplus moves to a single function.
 
-```python
-import re
-stats = {}
-for name in ["backtracking", "regicide"]:
-    cur = None
-    for line in open(f"{R}/profiles/{bench}-{name}.asm"):
-        h = re.match(r'^[0-9a-f]{8} (wasm\[0\]::\S+):', line)
-        if h:
-            cur = h.group(1).split('::')[-1]
-            stats.setdefault(cur, {})[name] = [0, 0, 0]
-            continue
-        m = re.match(r'\s+[0-9a-f]+:\s+(\S+)\s*(.*)', line)
-        if m and cur:
-            v = stats[cur][name]
-            v[0] += 1                                          # instructions
-            if re.search(r'\[sp', m.group(2)): v[1] += 1       # stack refs (see note)
-            if m.group(1) == 'mov' and ', #' not in m.group(2):
-                v[2] += 1                                      # reg-reg moves
+```bash
+python3 .claude/skills/analyze-regicide-codegen/scripts/asm_tools.py mix \
+    $R/profiles/$bench-backtracking.asm $R/profiles/$bench-regicide.asm
 ```
 
-A note on that `[sp` column: it counts **every** reference to `sp`, which
-includes the `stp`/`ldp` pairs of callee-saved registers in the prologue and
-epilogue, not just spills. That is fine for *ranking* functions, which is what
-this table is for. When you need the actual spill and reload count for a
-virtual-cycle table, use the narrower filter from the previous section, which
-requires a single register operand:
+It keys functions by full name (`wasm[0]::function[N]::name`), so a
+component's several core modules and two same-named functions do not merge
+(an earlier inline version keyed by the last `::` segment, which collapsed
+every unnamed `function[N]` in a stripped module into one row). Its stack
+column uses the narrow filter below, so prologue `stp`/`ldp` pairs are not
+counted:
 
 ```bash
 grep -cE "(str|ldr|stur|ldur)\s+[a-z0-9]+, \[sp" the.asm
 ```
 
-On one function those gave 32 and 20 respectively — the difference being frame
-setup. Quote the narrow number in a report, and say which you used.
+A broad `\[sp` match also counts frame setup; on one function the two gave 32
+and 20. Quote the narrow number in a report, and say which you used.
 
 Two follow-ups from the same parse, both of which paid off:
 
@@ -278,6 +269,29 @@ Two follow-ups from the same parse, both of which paid off:
   two sides were in the *same* region and the cause was refused coalescing
   (`MAX_MERGE_SPANS`); in tinygo-regex it was split peeling. 001 read it as a
   region boundary and was wrong. Go to the event counts (SKILL.md §5) next.
+- **Stack-slot-to-stack-slot copies** (`ldr xN, [sp, #a]` immediately
+  followed by `str xN, [sp, #b]`, `a != b`): a value moving between two
+  spill slots through a scratch register, two memory operations for nothing.
+  Ion almost never emits them. `asm_tools.py slot2slot` counts them per
+  function; in 005 tinygo `countMatches` had 2,107 against ion's 49, in
+  edge stubs before big joins, and the cause was block parameters getting
+  different spill slots from their arguments (known-findings §8). The same
+  count from `run`'s printout (a `Reload` then a `Spill` of the same register
+  to a different slot) agreed exactly.
+- **Exit stubs, not loop bodies.** When regicide's version of a loop is 3-5x
+  ion's size, count only the in-loop path (header to back edge, skipping
+  blocks that branch out). In 005, tinygo's loops were 43-71 instructions
+  against ion's 17-24, yet every in-loop path was *shorter* than ion's; the
+  bulk was 40-60-instruction stubs on the exits. That separates "the loop is
+  worse" from "leaving the loop is worse", which have different causes.
+
+### Matching loops between the two disassemblies
+
+Loop order and size differ between allocators, so match by the **heap offsets**
+a loop body touches (`[xN, #0x48]`, `[xN, #0x4c]`, …): that set comes from the
+source program, not the allocator. `asm_tools.py loops FUNC.asm` prints it per
+loop, innermost first, with the head's offset in its cache line and how many
+lines the loop spans (useful when a cycles change might be layout).
 
 ### Check whether the function even has loops
 

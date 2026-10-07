@@ -28,9 +28,19 @@ Every other option is forwarded to `samply-text record`, e.g. `-t` for a call
 tree or `-n 100` for more rows. Anything after `--` is passed to the Wasm
 program as its own arguments.
 
-Note that the flat view is topped by Wasmtime's idle threads parked in the
-async runtime, which are asleep rather than working. The guest's own frames sit
-under `array_call_native`, so `-t -n 200` is usually the view you want.
+The flat view is topped by Wasmtime's idle threads parked in the async
+runtime, which are asleep rather than working. The guest's own frames sit
+under `array_call_native`, so a call tree is usually the view you want. In
+tree mode `samply-text` hides subtrees under 0.1% of samples by default, which
+can hide most of a profile whose time is spread over many small functions; so
+unless `-s` is given, this script passes `-s 0.005`, and `-n 100000` unless
+`-n` is given.
+
+A component is profiled through its main core module, extracted with
+`wasm-tools component unbundle`, since Wasmtime cannot satisfy a component's
+`bench` imports with `-W unknown-imports-default`. This works when the
+component wraps one WASIp1 module and the `wasi_snapshot_preview1` adapter
+(e.g. kotlin-richards), and fails, saying so, otherwise.
 EOF
 }
 
@@ -39,6 +49,9 @@ regalloc=regicide
 wasm=
 samply_args=()
 guest_args=()
+tree=no
+have_threshold=no
+have_rows=no
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,8 +61,14 @@ while [[ $# -gt 0 ]]; do
         --)         shift; guest_args=(${1+"$@"}); break ;;
         # `samply-text record`'s own flags, which all take a value.
         -r|--rate|-n|--rows|--color|-s|--threshold)
+            case "$1" in
+                -s|--threshold) have_threshold=yes ;;
+                -n|--rows)      have_rows=yes ;;
+            esac
             samply_args+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
-        -t|--tree|-c|--collapse-recursion|--no-symbolicate)
+        -t|--tree)
+            tree=yes; samply_args+=("$1"); shift ;;
+        -c|--collapse-recursion|--no-symbolicate)
             samply_args+=("$1"); shift ;;
         -*)         samply_args+=("$1"); shift ;;
         *)
@@ -78,11 +97,50 @@ command -v samply-text >/dev/null || {
     exit 1
 }
 
+[[ "$tree" == yes && "$have_threshold" == no ]] && samply_args+=(-s 0.005)
+[[ "$have_rows" == no ]] && samply_args+=(-n 100000)
+
 wasm="$(cd "$(dirname "$wasm")" && pwd)/$(basename "$wasm")"
 wasm_dir="$(dirname "$wasm")"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cwasm="$work/$(basename "${wasm%.*}").cwasm"
+
+# A component's binary version field is `0d 00 01 00`; a core module's is
+# `01 00 00 00`.
+if [[ "$(od -An -tx1 -j4 -N4 "$wasm" | tr -d ' \n')" == 0d000100 ]]; then
+    command -v wasm-tools >/dev/null || {
+        echo "$wasm is a component, and profiling one needs wasm-tools on PATH" >&2
+        exit 1
+    }
+    echo "$wasm is a component; extracting its main core module..." >&2
+    mkdir "$work/unbundled"
+    # Threshold 0, so that a small main module is extracted too.
+    wasm-tools component unbundle --threshold 0 --module-dir "$work/unbundled" \
+        -o "$work/unbundled/stub.wasm" "$wasm"
+    # Print each module to a file first: under `pipefail`, `grep -q` closing
+    # the pipe early would fail the pipeline through SIGPIPE.
+    core=
+    for module in "$work"/unbundled/unbundled-module*.wasm; do
+        wasm-tools print "$module" > "$module.wat"
+        if grep -q '(export "_start"' "$module.wat"; then
+            core="$module"
+            break
+        fi
+    done
+    foreign=0
+    if [[ -n "$core" ]]; then
+        foreign=$(grep -E '^ *\(import "' "$core.wat" \
+            | grep -cvE '^ *\(import "(wasi_snapshot_preview1|bench)"' || true)
+    fi
+    if [[ -z "$core" || "$foreign" -ne 0 ]]; then
+        echo "$wasm does not wrap a single WASIp1 module with \`_start\`, so it" \
+            "cannot be profiled this way" >&2
+        exit 1
+    fi
+    wasm="$work/$(basename "${wasm%.*}")-core.wasm"
+    cp "$core" "$wasm"
+fi
 
 # Wasmtime's `profiling` profile is an optimized build that keeps line tables,
 # so the frames symbolicate instead of coming back as bare offsets.

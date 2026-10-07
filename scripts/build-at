@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# Build a scratch Wasmtime whose regicide is taken from another revision, and
+# compile Wasm modules with it, without touching this checkout.
+#
+# Answers "which regicide commit changed this benchmark's generated code or
+# runtime?" when replaying a corpus cannot, e.g. when the hot functions are
+# unchanged and only a whole-binary measurement shows the difference.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: build-at [OPTIONS] REV path/to/out path/to/wasm...
+
+Build Wasmtime against regicide at REV (any `git rev-parse`-able revision of
+the regicide worktree) and compile each module with it, writing
+`out/<module>-<REV>.cwasm`.
+
+Everything is built under a scratch directory: regalloc2 and Wasmtime come
+from `git archive` of their current HEADs, plus Wasmtime's uncommitted diff,
+so the only difference from this checkout's build is regicide.
+
+options:
+  -w, --work DIR         scratch directory (default: /tmp/build-at), reused
+                         between calls so later builds are incremental
+  -O, -C, -W, ... ARG    forwarded to `wasmtime compile` (default:
+                         `-O regalloc-algorithm=regicide`)
+  -h, --help             print this message
+
+Prints each `.cwasm` path on stdout. Validate the setup once by building at
+the revision a previous report measured and diffing against its `.cwasm`.
+EOF
+}
+
+work=/tmp/build-at
+compile_args=()
+rev=
+out=
+wasms=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -w|--work) work="${2:?--work needs a value}"; shift 2 ;;
+        -O|-C|-D|-W|-S)
+            compile_args+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        -*)        echo "unknown flag $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -z "$rev" ]]; then rev="$1"
+            elif [[ -z "$out" ]]; then out="$1"
+            else wasms+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$rev" && -n "$out" && ${#wasms[@]} -gt 0 ]] || { usage >&2; exit 2; }
+[[ ${#compile_args[@]} -gt 0 ]] || compile_args=(-O regalloc-algorithm=regicide)
+
+sha="$(git -C "$REPO/regicide" rev-parse --short "$rev")"
+mkdir -p "$work" "$out"
+
+# Refresh regalloc2 and Wasmtime only when their revisions change, so that
+# successive builds at different regicide revisions stay incremental.
+stamp="$(git -C "$REPO" rev-parse HEAD) $(git -C "$REPO/wasmtime" rev-parse HEAD) \
+$(git -C "$REPO/wasmtime" diff | git hash-object --stdin)"
+if [[ "$(cat "$work/stamp" 2>/dev/null)" != "$stamp" ]]; then
+    echo "refreshing scratch regalloc2 and wasmtime..." >&2
+    rm -rf "$work/regalloc2" "$work/wasmtime"
+    mkdir "$work/regalloc2" "$work/wasmtime"
+    git -C "$REPO" archive HEAD | tar -x -C "$work/regalloc2"
+    git -C "$REPO/wasmtime" archive HEAD | tar -x -C "$work/wasmtime"
+    git -C "$REPO/wasmtime" diff > "$work/wasmtime.patch"
+    if [[ -s "$work/wasmtime.patch" ]]; then
+        (cd "$work/wasmtime" && patch -s -p1 < "$work/wasmtime.patch")
+    fi
+    sed -i.orig 's|^regalloc2 = { path = "\.\.",|regalloc2 = { path = "'"$work"'/regalloc2",|' \
+        "$work/wasmtime/Cargo.toml"
+    grep -q "path = \"$work/regalloc2\"" "$work/wasmtime/Cargo.toml" || {
+        echo "could not point the scratch Wasmtime at the scratch regalloc2" >&2
+        exit 1
+    }
+    echo "$stamp" > "$work/stamp"
+fi
+
+# Copied rather than symlinked: cargo fingerprints a path dependency by its
+# path, so swapping a symlink's target silently reuses the previous build.
+echo "building wasmtime against regicide $sha..." >&2
+rm -rf "$work/regalloc2/regicide"
+mkdir "$work/regalloc2/regicide"
+git -C "$REPO/regicide" archive "$sha" | tar -x -C "$work/regalloc2/regicide"
+# `git archive` keeps commit timestamps, which can be older than the previous
+# build's, so cargo would not notice the change.
+find "$work/regalloc2/regicide" -type f -exec touch {} +
+CARGO_TARGET_DIR="$work/target" cargo build \
+    --manifest-path "$work/wasmtime/Cargo.toml" --release -p wasmtime-cli >&2
+
+for wasm in "${wasms[@]}"; do
+    name="$(basename "${wasm%.*}")"
+    [[ "$name" == benchmark ]] && name="$(basename "$(dirname "$wasm")")"
+    cwasm="$out/$name-$sha.cwasm"
+    "$work/target/release/wasmtime" compile ${compile_args[@]+"${compile_args[@]}"} \
+        -o "$cwasm" "$wasm"
+    echo "$cwasm"
+done

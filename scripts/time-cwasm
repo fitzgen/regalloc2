@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# Time several precompiled builds of one benchmark against each other,
+# interleaved, so that host noise lands on all of them alike.
+#
+# For comparisons sightglass cannot make: two `.cwasm`s from different
+# Wasmtime builds (see `build-at`), or an old report's artifacts against
+# today's.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+usage: time-cwasm [OPTIONS] BASELINE.cwasm OTHER.cwasm...
+
+Run each `.cwasm` once per round, in turn, for the given number of rounds,
+and report each one's median, 20%-trimmed mean and minimum time relative to
+the first. Deltas are (other - baseline) / baseline: negative is faster.
+
+The time is the benchmark's own `bench.start` to `bench.end` span, as
+sightglass measures it, from the monotonic clock: `bench` is provided by
+`scripts/support/bench-timer.wat`, so process startup and module loading are
+excluded.
+
+options:
+  -n, --rounds N    rounds (default: 40; 80 resolved ~2% steps on a loaded
+                    host)
+  -d, --dir DIR     directory the benchmark reads its inputs from, mounted as
+                    `.` (default: the current directory)
+  -o, --out FILE    also write the raw `label nanoseconds` samples here
+  -h, --help        print this message
+
+Every `.cwasm` must have been compiled by a Wasmtime that the release
+`wasmtime` in this checkout can load; `build-at`'s are.
+EOF
+}
+
+rounds=40
+dir=.
+out=
+cwasms=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--rounds) rounds="${2:?--rounds needs a value}"; shift 2 ;;
+        -d|--dir)    dir="${2:?--dir needs a value}"; shift 2 ;;
+        -o|--out)    out="${2:?--out needs a value}"; shift 2 ;;
+        -h|--help)   usage; exit 0 ;;
+        -*)          echo "unknown flag $1" >&2; usage >&2; exit 2 ;;
+        *)           cwasms+=("$1"); shift ;;
+    esac
+done
+
+[[ ${#cwasms[@]} -ge 2 ]] || { echo "need a baseline and at least one other" >&2; exit 2; }
+
+cargo build --manifest-path "$REPO/wasmtime/Cargo.toml" --release >&2
+wasmtime="$REPO/wasmtime/target/release/wasmtime"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+samples="$work/samples"
+timer="$work/bench-timer.wasm"
+command -v wasm-tools >/dev/null || { echo "wasm-tools is not on PATH" >&2; exit 1; }
+wasm-tools parse "$REPO/scripts/support/bench-timer.wat" -o "$timer"
+for ((i = 0; i < ${#cwasms[@]}; i++)); do
+    cwasms[i]="$(cd "$(dirname "${cwasms[i]}")" && pwd)/$(basename "${cwasms[i]}")"
+done
+
+cd "$dir"
+for ((i = 1; i <= rounds; i++)); do
+    for cwasm in "${cwasms[@]}"; do
+        ns=$("$wasmtime" run --allow-precompiled -S cli --preload "bench=$timer" \
+            --dir .::. "$cwasm" 2>&1 >/dev/null | sed -n 's/^bench-ns //p' | tail -1)
+        [[ -n "$ns" ]] || { echo "$cwasm failed, or never called bench.end" >&2; exit 1; }
+        echo "$(basename "$cwasm") $ns" >> "$samples"
+    done
+    printf '\rround %d/%d' "$i" "$rounds" >&2
+done
+echo >&2
+
+[[ -z "$out" ]] || cp "$samples" "$out"
+
+python3 - "$samples" "$(basename "${cwasms[0]}")" <<'PY'
+import collections, statistics as st, sys
+d = collections.defaultdict(list)
+for line in open(sys.argv[1]):
+    k, v = line.split()
+    d[k].append(float(v))
+base = sorted(d.pop(sys.argv[2]))
+k = len(base) // 5
+trim = lambda v: st.mean(v[k:len(v) - k]) if k else st.mean(v)
+cv = lambda v: 100 * st.stdev(v) / st.mean(v)
+pct = lambda a, b: 100 * (b - a) / a
+print(f"baseline {sys.argv[2]}: median {st.median(base) / 1e6:.3f} ms, CV {cv(base):.1f}%")
+for name, v in d.items():
+    v = sorted(v)
+    print(f"  {name:40} median {pct(st.median(base), st.median(v)):+6.2f}%  "
+          f"trim20 {pct(trim(base), trim(v)):+6.2f}%  min {pct(base[0], v[0]):+6.2f}%  "
+          f"CV {cv(v):.1f}%")
+PY

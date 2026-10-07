@@ -122,7 +122,7 @@ Wins get recorded precisely because the next change can silently undo them.
 
 One per benchmark, same shape for both directions.
 
-Three rules specific to these files:
+Four rules specific to these files:
 
 1. **Name both metrics in the title when they disagree**, e.g.
    `+2.23% instructions but -7.38% cycles`. A title quoting only the
@@ -136,6 +136,15 @@ Three rules specific to these files:
    / baseline`, negative = faster. When a table compares two runs or two
    regicide revisions rather than ion vs regicide, name the baseline in the
    column header (e.g. `moves, 630ca5e → 2a56dbe`).
+4. **Say whether the hot code changed since the last analysis**, near the top,
+   with the evidence (`asm_tools.py same`, corpus `cmp`, replay counts). If
+   it is byte-identical, link the previous report's analysis rather than
+   redoing it, and spend the file on what *is* new: the measurement, and any
+   function that did change. In 005, five benchmarks were settled this way,
+   and the one whose hot code was identical but whose cycles moved (hashset)
+   turned out to be the most informative report of the run. Two benchmarks
+   with identical hot code and the same verdict can share one file
+   (005: `regressions/keccak-and-blake3.md`).
 
 A benchmark can also belong in `regressions/` by instruction count while being
 a *win* on cycles. Keep it where the ranking put it, and say so plainly at the

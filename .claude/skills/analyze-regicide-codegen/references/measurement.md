@@ -43,38 +43,33 @@ early, not as a closing formality.** Spending 30 iterations of cycles on 40
 benchmarks to read 10 of them is waste, but so is writing up severity from
 instruction counts and then having to revise it.
 
-A cheap three-step that avoids both:
+The order that avoids both, now that every module compiles in seconds
+(005: the 14-benchmark `-i 5` screen in ~3 minutes, `-i 30` cycles on 8 in ~2):
 
 ```bash
-# 1. Subset screen: five or six small benchmarks, ~4 minutes. Enough to pick
-#    targets, and it does not block on the full screen.
-./scripts/sightglass -i 5 \
-    benchmarks/shootout/shootout-heapsort.wasm \
-    benchmarks/shootout/shootout-keccak.wasm \
-    > $R/sightglass-data/subset-insts-retired.csv
+# 1. The whole screen (suite minus host-bound modules; SKILL.md §2).
+./scripts/sightglass -i 5 $(sed 's|^|benchmarks/|' $R/sightglass-data/screen.suite) \
+    > $R/sightglass-data/screen-insts-retired.csv
 
-# 2. Cycles on those picks, in the background, BEFORE the deep analysis.
-./scripts/sightglass -m cycles -i 30 \
-    benchmarks/shootout/shootout-heapsort.wasm \
-    benchmarks/shootout/shootout-keccak.wasm \
+# 2. Cycles on every benchmark that ranked significant, either direction,
+#    BEFORE the deep analysis.
+./scripts/sightglass -m cycles -i 30 <picks> -- --pin \
     > $R/sightglass-data/confirm-cycles.csv
 
-# 3. The suite minus its host-bound modules, also in the background. The
-#    authority for ranking; its wall clock is dominated by slow regicide
-#    compiles (see "Compile time decides what you can measure").
-./scripts/sightglass -i 5 $(sed 's|^|benchmarks/|' $R/sightglass-data/screen.suite) \
-    > $R/sightglass-data/screen-insts-retired.csv   # screen.suite: SKILL.md §2
+# 3. -i 45 on whatever scripts/cycles_robustness.py calls NOISY or MIXED,
+#    and on any benchmark where the two metrics disagree in direction.
+./scripts/sightglass -m cycles -i 45 <those> -- --pin \
+    > $R/sightglass-data/confirm2-cycles.csv
 ```
 
-Observed agreement between (1) and (3): `shootout-sieve` came back at **+2.23%
-in both**, `shootout-keccak` at +11.00% / +11.06%. A cheap subset screen is a
-good substitute for picking targets.
+If compile time ever makes the full screen slow again, screen five or six
+small Wasm-bound benchmarks first so target selection does not wait on it.
+Observed agreement between such a subset and the full screen (001):
+`shootout-sieve` **+2.23% in both**, `shootout-keccak` +11.00% / +11.06%.
 
-One exception worth knowing: a benchmark can be *significant* in a `-i 5` subset
-run and *insignificant* in the `-i 3` full screen, purely on sample count —
-`shootout-heapsort` was +15.06% significant in one and +12.72% not significant
-in the other. Take the higher-sample number, and note that the low-power run
-*understated* a real regression rather than inventing one.
+A benchmark can be *significant* at `-i 5` and *insignificant* at `-i 3`
+purely on sample count (`shootout-heapsort`, +15.06% vs +12.72%). Take the
+higher-sample number; the low-power run understated a real regression.
 
 If cycles does not resolve, **say so in the report** and rank by
 `insts-retired`. Do not promote a noisy cycles number to a finding, and do not
@@ -129,22 +124,17 @@ mechanisms from the event log, not by analogy.
 ### Check robustness before believing any cycles result
 
 A surprising cycles number deserves the same scrutiny whichever direction it
-points. Four cheap checks, all from the raw CSV:
+points. Four cheap checks, all from the raw CSV, which
+`scripts/cycles_robustness.py` prints for every benchmark at once:
 
-```python
-import csv, collections, statistics as st
-d = collections.defaultdict(list)
-for r in csv.DictReader(open(csvfile)):
-    d[r['engine']].append(int(r['count']))
-bt, rg = sorted(d['backtracking']), sorted(d['regicide'])
-k = len(bt) // 5
-f = lambda a, c: 100 * (c - a) / a   # negative => regicide faster
-print("mean       ", f(st.mean(bt), st.mean(rg)))
-print("median     ", f(st.median(bt), st.median(rg)))
-print("20%-trimmed", f(st.mean(bt[:-k]), st.mean(rg[:-k])))
-print("minimum    ", f(bt[0], rg[0]))   # least noise-contaminated sample
-print("CV%        ", 100*st.stdev(bt)/st.mean(bt), 100*st.stdev(rg)/st.mean(rg))
+```bash
+python3 .claude/skills/analyze-regicide-codegen/scripts/cycles_robustness.py \
+    $R/sightglass-data/confirm-cycles.csv
 ```
+
+It reports mean, median, 20%-trimmed mean and minimum-to-minimum (negative =
+regicide faster), each engine's CV, and a verdict: `robust` (all four agree
+in sign), `MIXED` (some disagree), `NOISY` (an engine's CV over 5%).
 
 This is what distinguished the real results from the noise in that session:
 
@@ -156,6 +146,11 @@ This is what distinguished the real results from the noise in that session:
   code-layout change (see above). Robust is not the same as attributable.
 - `hashset` +7.02%: **1.8x spread inside one engine's own 30 samples** (CV
   13.9%). Not a result; reported as noise.
+- 005, `blake3-scalar` +4.20%: median -0.43%, regicide CV 16.3% from one
+  outlier sample. `NOISY`; re-measured at `-i 45`: -0.56% n.s.
+- 005, `hashset` +5.19% / +4.20% (two runs): CV 4-7%, median and trimmed mean
+  +3 to +5% in both; then +6.19% with 64-byte function alignment. Real, and
+  not layout.
 
 Quote the minimum-to-minimum figure when a result matters — it is the most
 conservative framing and the least contaminated by scheduler noise.
@@ -173,6 +168,26 @@ is often the most interesting signal available:
   expensive work. Usually a move eliminated in favor of a stack operand.
 
 Note the disagreement and go look at the code; that is where the finding is.
+In 005 both kinds appeared and were the run's headline: sqlite3 (+6.28%
+insts, -5% cycles; 29% fewer stack accesses) and hashset (-3.93% insts, +5%
+cycles; ~3,400 extra reloads each right after a call).
+
+**Rule out layout** before attributing either to the allocator: re-run with
+`-C cranelift-log2_min_function_alignment=6` passed to both engines (SKILL.md
+§2 has the command). It shifts every function's placement and leaves
+allocation alone.
+
+### Timing outside sightglass
+
+For comparisons sightglass cannot express (Wasmtime built at two regicide
+revisions, an old report's `.cwasm` against today's), `scripts/time-cwasm`
+interleaves runs and times the `bench.start`..`bench.end` span. It is a
+bisection and diagnosis tool; the report's top line still comes from
+sightglass. It is just as sensitive to host load: at load ~10 with 80
+rounds it resolved ~2% steps, at load 30+ nothing.
+
+**Never run builds of your own alongside any timing.** In 005 four scratch
+`cargo build`s raised hashset's CV from ~5% to 29% and the run was discarded.
 
 ---
 
@@ -363,15 +378,13 @@ tool for choosing what to analyze.
 
 ## Compile time decides what you can measure
 
-Sightglass compiles the module once per measured process. A module regicide
+Sightglass compiles the module once per measured process, so a module regicide
 compiles slowly multiplies straight into the run: in 002, tinygo-regex took
-regicide ~40 minutes per compile, so a `-i 5` screen (2 processes) spent ~80
-minutes on it alone and a `-i 30` cycles run would have taken ~7 hours. Know
-each module's regicide compile time (from the §1/§4 disassembly) before
-choosing which modules go into which run, and keep the slow ones separate.
-For a module too slow to measure on cycles, the profile from its `.cwasm`
-(guest samples per run) is the fallback — label it as a profile, not a
-measurement.
+~40 minutes per compile, so a `-i 5` screen spent ~80 minutes on it alone and a
+`-i 30` cycles run would have taken ~7 hours. **At regicide `288da68` (005)
+every `pca.suite` module compiles in seconds**, so this no longer shapes the
+plan. Keep an eye on §1/§4 disassembly times anyway: a module that suddenly
+takes minutes is both a scheduling problem and, usually, a codegen finding.
 
 ## Bookkeeping
 

@@ -5,7 +5,7 @@ they are short, commented bash. This file is the summary; `-h` is the source of
 truth if they drift.
 
 All of them build Wasmtime or regicide on first use, and the first build of a
-given cargo profile is slow (tens of minutes for Wasmtime). Prefer running them
+given cargo profile is slow (several minutes for Wasmtime with warm dependencies, much longer from cold). Prefer running them
 in the background over waiting.
 
 ---
@@ -94,12 +94,37 @@ fixed span because one iteration of a small program yields too few samples.
 | `-h`, `--help` | | |
 
 Every other flag is forwarded to `samply-text record`: `-t`/`--tree` for a call
-tree, `-n N` for more rows, `-r` for the sampling rate. Anything after `--` goes
-to the Wasm program as its own arguments.
+tree, `-c` to collapse direct recursion, `-s PCT` for the tree's pruning
+threshold, `-n N` for more rows, `-r` for the sampling rate. Anything after
+`--` goes to the Wasm program as its own arguments. **Defaults it adds:**
+`-n 100000` unless `-n` is given, and with `-t`, `-s 0.005` unless `-s` is
+given. `samply-text`'s own default (`-s 0.1`) hid 76% of sqlite3's guest
+samples.
 
-**Use `-t`.** The flat view is topped by Wasmtime's idle threads parked in the
-async runtime — asleep, not working. The guest's own frames are under
-`array_call_native`, so `-t -n 200` is the view you want.
+**Use `-t`, keep the stderr.** The flat view is topped by Wasmtime's idle
+threads parked in the async runtime — asleep, not working. The guest's own
+frames are under `array_call_native`. Redirect stderr to
+`<name>.prof.stderr` beside the profile: its `loop-driver: N run(s)` line is
+what `scripts/guest_profile.py` normalizes by.
+
+```bash
+./scripts/profile -t --loop 10 B.wasm > $R/profiles/B-regicide.txt 2> $R/profiles/B-regicide.prof.stderr
+python3 .claude/skills/analyze-regicide-codegen/scripts/guest_profile.py \
+    $R/profiles/B-backtracking.txt $R/profiles/B-regicide.txt
+```
+
+`guest_profile.py` ranks frames under `array_to_wasm_trampoline` by self
+samples per run, prints a base/candidate delta table, and a **coverage**
+figure (visible self samples ÷ trampoline total). Below ~75% the tree was
+pruned; lower `-s`.
+
+**Components.** Given a component, the script extracts its main core module
+with `wasm-tools component unbundle --threshold 0` and profiles that, when the
+component wraps one WASIp1 module exporting `_start` whose only imports are
+`wasi_snapshot_preview1` and `bench` (kotlin-richards). It refuses anything
+else, e.g. cm-online-stats, a composition of components. Function indices in
+the profile are then the core module's, matching a disassembly of the
+extracted module, and the component's `wasm[0]::` functions.
 
 Built with the `profiling` cargo profile (optimized, with line tables) and run
 with `--profile=perfmap`, so the JIT-compiled Wasm frames symbolicate instead of
@@ -107,8 +132,9 @@ coming back as bare offsets.
 
 ### Profiling an existing `.cwasm`
 
-`scripts/profile` recompiles the module every time. When regicide takes tens
-of minutes to compile it (tinygo-regex: 40 minutes; sqlite3: 10), profile the
+`scripts/profile` recompiles the module every time. That takes seconds at
+present; if regicide ever takes minutes to compile a module again
+(tinygo-regex took 40 minutes in 002), profile the
 `.cwasm` that `scripts/disassemble` already wrote, with the release
 `wasmtime`. samply cannot inject into the system-signed `/bin/sh`, so the
 re-run loop must be a compiled binary:
@@ -165,6 +191,58 @@ cd ~/sightglass/benchmarks/bz2 && \
 
 The `cd` and `--dir .` matter: benchmarks open their inputs by relative path.
 
+`scripts/support/bench-timer.wat` is a `bench` stub that also **times** the
+benchmark: it reads the monotonic clock at `bench.start` and `bench.end` and
+writes `bench-ns <N>` to stderr, the same span sightglass measures, without
+process startup. `scripts/time-cwasm` uses it.
+
+---
+
+## `scripts/build-at` — Wasmtime with regicide from another revision
+
+```
+./scripts/build-at [-w DIR] [COMPILE_OPTIONS] REV path/to/out path/to/wasm...
+```
+
+Builds a scratch Wasmtime under `/tmp/build-at` (or `-w DIR`) whose regicide
+is `git archive REV` of the regicide worktree, everything else being this
+checkout's regalloc2 HEAD and Wasmtime HEAD plus its uncommitted diff, and
+compiles each module to `out/<module>-<sha>.cwasm`. The first build takes
+~3.5 minutes; later revisions rebuild incrementally (~15 s plus regicide).
+Nothing in the real checkouts is touched.
+
+For a runtime bisect across regicide commits, when replaying a corpus cannot
+show the cost (005, hashset: hot code unchanged, cycles moved 6 pp). Validate
+the setup by building at the revision an old report measured and checking
+its `.cwasm` disassembles identically (`wasmtime objdump --funcs all X.cwasm
+| md5`). Two traps it handles, worth knowing if you do this by hand: a
+symlinked regicide swapped between revisions is not rebuilt (cargo
+fingerprints by path), and `git archive` preserves old mtimes, which cargo
+can take as up to date.
+
+Regicide revisions whose public API differs from what regalloc2's shim
+expects will not build; the error names the API. Everything from `e9b676b`
+(2026-10-06) to `288da68` builds.
+
+## `scripts/time-cwasm` — interleaved timing of precompiled builds
+
+```
+./scripts/time-cwasm [-n ROUNDS] [-d DIR] [-o FILE] BASELINE.cwasm OTHER.cwasm...
+```
+
+Runs each `.cwasm` once per round for `-n` rounds (default 40), in turn, so
+host noise falls on all alike, timing the `bench.start`..`bench.end` span via
+`bench-timer.wat`. Prints each one's median, 20%-trimmed and minimum delta
+against the first, in the house sign convention. `-d` is the directory the
+benchmark reads its inputs from (`~/sightglass/benchmarks/<dir>`).
+
+Uses: comparing `build-at` outputs; timing an old report's
+`profiles/asm/*.cwasm` beside today's (005 reproduced 003's hashset result
+this way); a quick A/B before committing to a sightglass run. It is not a
+substitute for sightglass cycles in the report's top line. ~80 rounds
+resolved ~2% differences on a host at load 10-15; at load 30+ (005, other
+sessions' jobs) CV reached 25% and nothing resolved.
+
 ---
 
 ## `scripts/disassemble` — see the generated code
@@ -196,6 +274,25 @@ diff -u /tmp/b.asm /tmp/r.asm
 
 **Match functions by name, not index or offset** — numbering and ordering can
 differ between the two.
+
+A component disassembles fine; each core module's functions are prefixed
+`wasm[0]::`, `wasm[1]::`, and so on.
+
+### `asm_tools.py` — the mechanical analyses
+
+`.claude/skills/analyze-regicide-codegen/scripts/asm_tools.py` works on
+`--funcs all --addresses` output:
+
+| subcommand | what |
+| --- | --- |
+| `mix BASE.asm CAND.asm` | per-function insts / stack accesses / reg-reg moves, both allocators, sorted by delta |
+| `extract FILE.asm N [--strip]` | one `function[N]`; `--strip` masks addresses for diffing builds |
+| `same OLD.asm NEW.asm` | which functions changed between two builds, ignoring addresses |
+| `loops FUNC.asm` | loops innermost first, with `head%64`, cache lines spanned, heap-offset fingerprint |
+| `slot2slot BASE.asm CAND.asm` | stack-slot-to-stack-slot copies per function (known-findings §8) |
+
+Stack accesses use the narrow filter (single register to `[sp`), so
+prologue `stp`/`ldp` pairs are not counted.
 
 ---
 
@@ -391,14 +488,26 @@ analysis; the override flags are for asking "what if this pass were off?", which
 is a genuinely useful experiment — e.g. `-r none` tells you how much redundant
 move elimination is buying on this function.
 
-Output per input is the allocation (unless `-q`) followed by a counts line:
+Output per input is the allocation (unless `-q`) followed by a counts block:
 
 ```
-moves 12  spills 3  reloads 5  remats 0  critical-edges 1  slots 4
+  moves 12  spills 3  reloads 5  remats 0  critical-edges 1  slots 4
+  of which cold: moves 1  spills 0  reloads 0  remats 0
+  estimated-cycles 310.2  reg-operands 220.0  stack-operands 0.0  moves 11.0 ...
+  coalesce-out-of-fuel 0
 ```
 
 These are **the numbers to diff between two builds**, and the per-corpus
-`=== totals ===` line at the end aggregates them. `moves` is register-register
+`=== totals ===` block at the end aggregates them. It is several lines, so
+take it with `grep -A4 '=== totals'`, not `tail -1` (which shows only
+`coalesce-out-of-fuel`). `estimated-cycles` weights each block by loop depth
+and cold blocks by 0.05; older `run` builds lack the last three lines.
+
+In the full (non-`-q`) printout each edit is a line such as
+`edit: Move(Reload { from: stack84, to: r21 })`, and each block's header
+lists its parameters' allocations. A `Reload` from one slot immediately
+followed by a `Spill` of the same register to a different slot is a
+stack-to-stack copy (known-findings §8). `moves` is register-register
 moves only; `spills` and `reloads` are the ones that touch memory. `slots` is
 the stack frame size in spill slots.
 
@@ -418,11 +527,17 @@ between allocators — it cannot be one.
 A function needing more registers at once than the machine has is reported as
 `skipped`, which is a property of the input rather than a bug.
 
-**Some single functions take minutes to replay** (tinygo `countMatches`: 471 s;
-sqlite3's VDBE loop: 502 s) — the split-peel loop in known-findings §3. Run
-those in the background, and replay a corpus per function with a timeout
-(`timeout 60 run -q one.postcard`) rather than as one directory, so one slow
-function does not hide the rest.
+**Replays are fast at current revisions** (005: tinygo `countMatches`
+1.2 s, sqlite3's VDBE ~1 s). They were not always (002: 471 s and 502 s,
+the split-peel loop of known-findings §3), and old revisions built for a
+before/after comparison still are (`e9b676b` replays the VDBE in 58 s). Use
+a timeout per function (`timeout 900 run -q one.postcard`) when replaying
+through an old build, so one slow function does not hide the rest.
+
+**A full trace of one big function is enormous.** `RUST_LOG=trace` on
+`countMatches` is over 64 MB. Narrow to the targets you need
+(`regicide::region_allocation=trace,regicide::coalescing=trace`) and write it
+to a file rather than reading it through a tool.
 
 ### Rendering one visualization from a corpus input
 

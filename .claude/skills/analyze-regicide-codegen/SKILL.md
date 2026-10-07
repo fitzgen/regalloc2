@@ -30,7 +30,11 @@ This skill is steps 1 and 2 of a four-step loop:
 established, with the evidence and status of each, plus the open questions in
 priority order. It will save you rediscovering the main finding, and it records
 two wrong turns a previous run actually took. Verify anything load-bearing still
-holds; regicide changes.
+holds; regicide changes. Also read the user's step-3 notes,
+`regicide/.claude/skills/optimize-regicide-codegen/references/known-findings.md`
+(read-only): it records which of this skill's findings were attempted, which
+landed under which commit, and what was dropped and why, so a recommendation
+here does not re-propose a probe that already failed.
 
 **You are not responsible for changing regicide.** The user implements step 3
 themselves, elsewhere, in other branches and worktrees. Your deliverable is a
@@ -126,46 +130,41 @@ takes a few minutes with warm dependencies. **Start the long jobs in the
 background and write up the previous step while they run** — never sit idle
 watching a build.
 
-The expensive thing is not the builds, it is the **screen**, and what makes
-it expensive is **regicide's compile time**, not execution. Sightglass compiles
-the module inside *every measured process*, so a module regicide takes 40
-minutes to compile (`tinygo-regex`, analysis 002) costs 40 minutes × processes
-per run. That one module turned a ~10-minute screen into ~2 hours. Sightglass
-buffers its CSV to the end, so a half-finished screen gives you nothing.
-
-**Before launching any sightglass run, check per-module compile time** — the
-§1 disassemblies tell you, and `references/known-findings.md` §0 lists the
-known slow ones. Run slow modules in their own invocation so they do not hold
-the rest of the results hostage, and do not put a 40-minute module in a
-`-i 30` cycles run (~7 hours).
+**Compile time no longer gates the screen** (analysis 005, regicide
+`288da68`): the whole 14-benchmark `-i 5` screen took ~3 minutes, an
+8-benchmark `-i 30` cycles run ~2 minutes, and every module in `pca.suite`
+compiles in seconds under regicide. In 002 a single module (`tinygo-regex`,
+then 40 minutes per compile) turned a 10-minute screen into 2 hours, because
+sightglass compiles inside every measured process. If a regicide change
+brings a slow compile back, it will show up in §1's disassembly time; then
+run that module in its own invocation and keep it out of `-i 30` cycles runs.
+Sightglass buffers its CSV to the end, so a half-finished run gives you
+nothing.
 
 A sequence that keeps the critical path short:
 
 1. §0 report skeleton (seconds).
-2. **Check the host is quiet** — `uptime`, `ps -Ao %cpu,comm -r`. Do this
+2. **Check the host is quiet**: `uptime`, `ps -Ao %cpu,comm -r`. Do this
    *first*, not when a result fails to resolve. `cycles` is the metric that
-   decides, and on a loaded machine it will not resolve; see §2.
-3. §1 preflight — the first `release` Wasmtime build. Start it, then finish §0.
-4. §2 a **cheap subset screen** over five or six small benchmarks (`-i 5`,
-   ~4 minutes). Pick ones whose hot code is genuinely Wasm rather than Wasmtime
-   host runtime — §4 says how to tell, and on `pca.suite` the three largest
-   benchmarks all fail that test. This is enough to choose targets, and gets
-   you to real analysis roughly an hour sooner than waiting for the full
-   screen.
-5. §2 the `insts-retired` screen of the suite minus its host-bound modules,
-   in the background. It is the authority for ranking and for any suite-wide
-   claim, but nothing needs to block on it.
-6. **Launch `cycles` on the subset picks as soon as you have them**, in the
-   background — *not* after the analysis. See the warning below.
-7. §3 per-module corpora for the benchmarks you are going to analyze.
-8. §4–§5 profile and analyze, benchmark by benchmark, writing each report as
-   you finish it. This is where the thinking happens. **Read the event-log
-   counts first** (§5, "Start from the event counts") — in 002 they localized
-   every mechanism faster than the disassembly did.
-9. When the full screen lands, re-check your picks against it, and start the
-   disassembly of the worst regression immediately if it is not already
-   covered — it is usually the longest-running tool invocation you will issue.
-10. §6 aggregate report.
+   decides, and on a loaded machine it will not resolve; see §2. Note what
+   you cannot stop (the user's fuzzers and experiments, endpoint security)
+   in `misc/measurement-notes.md`.
+3. §1 preflight, which pays for the first `release` Wasmtime build (~7 min
+   after regalloc2/regicide changes). Write §0 while it builds.
+4. §2 the `insts-retired` screen of the whole suite minus its host-bound
+   modules (~3 min).
+5. **Immediately** `cycles` on everything that ranked significant either way
+   (`-i 30`), then `-i 45` on any result that is noisy or disagrees in
+   direction with instructions (~2 min each). See the warning below.
+6. §3 per-module corpora and §4 disassemblies for every benchmark you will
+   analyze, in the background (seconds to a few minutes each). **Do not run
+   them during a cycles run**; your own builds are the one load you control.
+7. §4-§5 profile and analyze, benchmark by benchmark, writing each report as
+   you finish it. **Start from what changed since the last analysis**
+   (§5, "Start from the diff against the last analysis"): in 005, 5 of 8
+   benchmarks' hot functions were byte-identical to 003's, which settled
+   them in minutes and pointed straight at the ones that moved.
+8. §6 aggregate report.
 
 ### Launch `cycles` early, and do not write severity claims before it lands
 
@@ -294,32 +293,40 @@ and frequently will not resolve at all. Full policy and the reasoning in
 cd ~/regalloc2
 R=reports/codegen-analysis-NNN   # the directory from §0
 
-# 1. Subset screen: a handful of small, Wasm-bound benchmarks. ~4 minutes, and
-#    enough to pick targets so the analysis is not blocked on the full screen.
-./scripts/sightglass -i 5 \
-    benchmarks/shootout/shootout-heapsort.wasm \
-    benchmarks/shootout/shootout-keccak.wasm \
-    benchmarks/shootout/shootout-sieve.wasm \
-    > $R/sightglass-data/subset-insts-retired.csv
-
-# 2. Cycles on those picks, in the background, BEFORE the deep analysis.
-#    Do not leave this until the end; see references/measurement.md.
-./scripts/sightglass -m cycles -i 30 <the same benchmarks> \
-    > $R/sightglass-data/confirm-cycles.csv
-
-# 3. The suite minus its host-bound modules, in the background. `splay`,
-#    `shootout-memmove` and `cm-online-stats` are 97.8% of pca.suite's cost and
-#    have no register-allocated hot code (§4); dropping them leaves budget for
-#    -i 5, which resolves what -i 3 misses. Slow-compiling modules dominate
-#    the wall clock (see "How to sequence the work").
+# 1. The suite minus its host-bound modules. `splay`, `shootout-memmove` and
+#    `cm-online-stats` are 97.8% of pca.suite's cost and have no
+#    register-allocated hot code (§4). ~3 minutes in 005.
 grep -v '^[[:space:]]*#' ~/sightglass/benchmarks/pca.suite | grep -v '^[[:space:]]*$' \
     | grep -vE 'splay|memmove|cm-online' > $R/sightglass-data/screen.suite
 ./scripts/sightglass -i 5 $(sed 's|^|benchmarks/|' $R/sightglass-data/screen.suite) \
     > $R/sightglass-data/screen-insts-retired.csv
+
+# 2. Cycles on every benchmark that ranked significant either way, BEFORE the
+#    deep analysis. `--pin` binds each process to one core (advisory on Apple
+#    Silicon; cannot hurt).
+./scripts/sightglass -m cycles -i 30 <the picks from rank_benchmarks.py> -- --pin \
+    > $R/sightglass-data/confirm-cycles.csv
+
+# 3. Again at -i 45 on whatever cycles_robustness.py calls NOISY or MIXED, and
+#    on any benchmark where cycles and instructions disagree in direction.
+./scripts/sightglass -m cycles -i 45 <those> -- --pin \
+    > $R/sightglass-data/confirm2-cycles.csv
+python3 .claude/skills/analyze-regicide-codegen/scripts/cycles_robustness.py \
+    $R/sightglass-data/confirm-cycles.csv
 ```
 
-Sightglass buffers its CSV until the end, so a long screen gives you nothing
-until it finishes — there is no partial output to poll.
+`cycles_robustness.py` prints mean, median, 20%-trimmed mean and
+minimum-to-minimum per benchmark with a verdict: `robust` when all four
+agree in sign, `MIXED` when they do not, `NOISY` when either engine's CV
+exceeds 5%. In 005 it flagged blake3's +4.20% "regression" (one 16%
+outlier; median -0.43%) on sight.
+
+If a compile-time regression ever makes the full screen slow again, fall back
+to a subset screen of five or six small Wasm-bound benchmarks first so the
+analysis is not blocked on it.
+
+Sightglass buffers its CSV until the end, so a long run gives you nothing
+until it finishes; there is no partial output to poll.
 
 Then rank the benchmarks and pick the extremes:
 
@@ -337,13 +344,6 @@ python3 ~/regalloc2/.claude/skills/analyze-regicide-codegen/scripts/rank_benchma
 and whether sightglass calls it significant, then the top-`N` each way as
 copy-pasteable `.wasm` paths for the confirmation run. Save its output into
 `$R/sightglass-data/ranking.txt`.
-
-When the full screen lands, re-rank against it and check your picks. If a
-benchmark you have not analyzed outranks the ones you have, **start its
-disassembly immediately and in the background** — that is usually the
-longest-running tool call in the whole analysis, and on one occasion the worst
-regression took ~25 minutes to disassemble and turned out to be the strongest
-evidence in the report. Run cycles on it too if it was not in the subset.
 
 Read `references/measurement.md` before interpreting any of this. The four
 things that most often go wrong:
@@ -369,10 +369,28 @@ things that most often go wrong:
 
 If `insts-retired` and `cycles` disagree in direction, that is informative
 rather than suspicious: it usually means moves were traded for memory traffic
-(or the reverse). Note it and look at the code. But check whether the hot loop
-actually differs from ion's first — in 002, sieve's disagreement (001: more
-instructions, fewer cycles) turned out to sit on an *identical* loop, and is
-more likely code layout than allocation.
+(or the reverse). In 005, sqlite3 was +6.28% instructions and **-5% cycles**
+(regicide has 29% fewer stack accesses, 37% more moves), and hashset -3.93%
+instructions and **+5% cycles**. Both were the most important results of the
+run. Note it and look at the code.
+
+**Rule out layout before attributing a cycles delta to the allocator.** In
+002, sieve's disagreement sat on an *identical* loop and was probably code
+layout. The cheap control is to re-run cycles with
+`-C cranelift-log2_min_function_alignment=6` on both engines, which moves every
+hot loop within its cache line without changing allocation:
+
+```bash
+cd ~/sightglass
+E=~/regalloc2/wasmtime/target/release/libwasmtime_bench_api.dylib
+cargo run --release -q -- benchmark \
+  -e $E --engine-flags "-O regalloc-algorithm=regicide -C cranelift-log2_min_function_alignment=6" -n regicide \
+  -e $E --engine-flags "-O regalloc-algorithm=backtracking -C cranelift-log2_min_function_alignment=6" -n backtracking \
+  --benchmark-phase execution -m cycles --processes 15 --iterations-per-process 3 --pin \
+  --raw -f csv benchmarks/hashset/benchmark.wasm > ~/regalloc2/$R/sightglass-data/align6-cycles.csv
+```
+
+If the delta survives (hashset's did: +6.19%), it is not layout.
 
 ## 3. Build a corpus
 
@@ -391,13 +409,14 @@ cd ~/regalloc2
     ~/sightglass/benchmarks/shootout/shootout-keccak.wasm
 ```
 
-A whole-suite corpus is also useful — it is a fixed, reusable workload and the
-source of the suite-wide static baseline — but **treat it as an optional
-background job that may not finish.** It runs a Wasmtime compile per module,
-and on `pca.suite` one attempt reached 2 of 17 modules in 68 minutes before
-being abandoned; the per-module corpora carried the whole analysis instead. If
-you want it, start it early, do not block on it, and do not let it compete for
-CPU with the measurements that matter.
+In 005 the five per-module corpora took 9 s to 195 s each (sqlite3: 3,472
+inputs, the slowest). Replaying the hottest functions takes about a second
+each (tinygo `countMatches`: 1.2 s, down from 471 s in 002).
+
+A whole-suite corpus is also useful: it is a fixed, reusable workload and the
+source of the suite-wide static baseline. It used to be impractical (002:
+2 of 17 modules in 68 minutes); at current compile speeds it should finish,
+but run it in the background and never alongside a cycles run.
 
 Expand the suite into module paths and hand them all to `make-corpus` at once —
 one invocation, so a single Wasmtime build serves every module:
@@ -482,9 +501,15 @@ cargo build --release --all-features --example run
 
 OLD=/tmp/regicide-OLD/target/release/examples/run
 NEW=~/regalloc2/regicide/target/release/examples/run
-$OLD -q ../reports/codegen-analysis-NNN/corpus | tail -1
-$NEW -q ../reports/codegen-analysis-NNN/corpus | tail -1
+# The totals block is several lines; `tail -1` alone shows only its last,
+# `coalesce-out-of-fuel`.
+$OLD -q ../reports/codegen-analysis-NNN/corpus | grep -A4 '=== totals'
+$NEW -q ../reports/codegen-analysis-NNN/corpus | grep -A4 '=== totals'
 ```
+
+Revisions `7d1217e`..`f12e432` (at least) do not build with the `run`
+example's features: delete the line `self.split_span_vals.clear();` from
+`src/region_allocation.rs` in the scratch copy first.
 
 **Validate first:** the OLD build on the old corpus should reproduce the old
 report's published counts exactly. In 002 it did, to the move, which is what
@@ -499,6 +524,46 @@ proposal.
 
 The converse — **same regicide, old vs new corpus** — isolates what changed in
 Cranelift's inputs (e.g. new remat or block-frequency information).
+
+**Bisect one function across several revisions** the same way: build `run`
+at each revision into `/tmp/regicide-<rev>` and replay one input through
+all of them. In 005 that located, in minutes, the commit that tripled
+tinygo `countMatches`' stack-to-stack copies (`7d1217e`: 710 → 2,176) and
+cut sqlite3's VDBE reloads 37%.
+
+### Before/after a regicide change, at runtime: `scripts/build-at`
+
+A corpus replay cannot tell you what a change cost in cycles, and it cannot
+help when **the hot functions did not change** but the benchmark's time did.
+In 005, hashset's four hot functions were byte-identical to 003's and its
+cycles still moved from -2% to +5%; the cause was a 1.5%-self-time driver
+function whose extra reloads sat on the path of 11,000 calls. Only a
+runtime bisect found it.
+
+```bash
+cd ~/regalloc2
+# Each call builds a scratch Wasmtime under /tmp/build-at with regicide taken
+# from that revision (everything else is this checkout's HEAD plus Wasmtime's
+# uncommitted diff), then compiles the modules. ~3.5 min first, ~15 s after.
+for rev in e9b676b 36e91a7 7d1217e HEAD; do
+    ./scripts/build-at $rev $R/bisect ~/sightglass/benchmarks/hashset/benchmark.wasm
+done
+
+# Interleaved timing of the bench.start..bench.end region, baseline first.
+./scripts/time-cwasm -n 80 -d ~/sightglass/benchmarks/hashset \
+    $R/profiles/asm/hashset-backtracking.cwasm $R/bisect/hashset-*.cwasm
+```
+
+**Validate first**, as with replays: build at the revision an old report
+measured and confirm its `.cwasm` disassembles identically to that report's
+(005: `objdump | md5` matched 003's exactly). `asm_tools.py same OLD NEW`
+then lists which functions each step changed, which is what localizes the
+cause. `time-cwasm` needs ~80 rounds to resolve ~2% steps on a loaded host,
+and like any timing it must not share the machine with your own builds.
+
+**An old report's `.cwasm`s are a free baseline.** `disassemble` leaves them
+in `$R/profiles/asm/`, and they still load in today's Wasmtime; timing 003's
+beside today's reproduced both reports' cycles results in one session.
 
 ## 4. Find the hot code
 
@@ -518,7 +583,7 @@ allocator. Measured on `pca.suite`:
 | --- | ---: | --- |
 | `splay` | **79.8%** | ~96% inside `wasmtime_builtin_gc_alloc_raw` (host GC) |
 | `shootout-memmove` | 10.1% | ~99% inside `wasmtime_builtin_memory_copy` |
-| `cm-online-stats` | 7.9% | a *component*; `scripts/profile` cannot run it |
+| `cm-online-stats` | 7.9% | a multi-component composition; `scripts/profile` cannot run it |
 
 Those three are **97.8% of the suite's instruction count**, and the screen
 confirmed the prediction: they came back at +0.00%, +0.26% and +0.37%, i.e.
@@ -537,37 +602,56 @@ The check is one look at the call tree under `array_call_native`: if the
 inclusive time collapses into a `wasmtime_builtin_*` frame, the benchmark is
 host-bound.
 
-**Components cannot be profiled.** `scripts/profile` passes
-`-W unknown-imports-default` to satisfy sightglass's `bench.start`/`bench.end`
-imports, and Wasmtime rejects that flag for components:
-
-```
-cannot use `--default-values-unknown-imports` with components
-```
-
-`cm-online-stats` and `kotlin-richards` are both components. They still appear
-in the screen — sightglass runs them fine — but cannot be taken to §4/§5 by
-this route.
+**Components are profiled through their core module.** `scripts/profile`
+detects a component and extracts its main core module with
+`wasm-tools component unbundle`. That works when the component wraps a single
+WASIp1 module and the `wasi_snapshot_preview1` adapter, as `kotlin-richards`
+does (005 profiled it this way for the first time; its stdout matches the
+benchmark's expected output, and its code is identical to the component's).
+`cm-online-stats` is a composition of several components and is refused, with
+a message saying so. `scripts/disassemble` handles components directly; their
+functions appear as `wasm[0]::`, `wasm[1]::`, … per core module.
 
 ```bash
 cd ~/regalloc2
-./scripts/profile -t -n 200 ~/sightglass/benchmarks/bz2/benchmark.wasm \
-    > $R/profiles/bz2-regicide.txt
-./scripts/profile -t -n 200 --regalloc backtracking \
+./scripts/profile -t --loop 10 ~/sightglass/benchmarks/bz2/benchmark.wasm \
+    > $R/profiles/bz2-regicide.txt 2> $R/profiles/bz2-regicide.prof.stderr
+./scripts/profile -t --loop 10 --regalloc backtracking \
     ~/sightglass/benchmarks/bz2/benchmark.wasm \
-    > $R/profiles/bz2-backtracking.txt
+    > $R/profiles/bz2-backtracking.txt 2> $R/profiles/bz2-backtracking.prof.stderr
+
+python3 .claude/skills/analyze-regicide-codegen/scripts/guest_profile.py \
+    $R/profiles/bz2-backtracking.txt $R/profiles/bz2-regicide.txt
 ```
+
+Keep the `.prof.stderr`: it holds the loop driver's run count, which
+`guest_profile.py` divides by. It ranks the frames under
+`array_to_wasm_trampoline` by **self samples per run** and prints a
+side-by-side delta.
 
 Read the **call tree** (`-t`), not the flat view: the flat view is topped by
 Wasmtime's idle threads parked in the async runtime, which are asleep rather
 than working. The guest's frames sit under `array_call_native`.
 
+**Check the coverage line.** `guest_profile.py` reports what fraction of the
+guest's samples the tree's visible self samples account for. `samply-text`
+prunes subtrees under its `-s` threshold (default 0.1%), and for sqlite3,
+whose time is spread over many small functions, a pruned tree showed **24%**
+coverage and a ranking missing its second-hottest function. `scripts/profile`
+now passes `-s 0.005 -n 100000` unless told otherwise; if coverage is still
+below ~75%, lower `-s` further.
+
 **`scripts/profile` recompiles the module every time**, with the `profiling`
-profile. For a module regicide takes tens of minutes to compile, profile the
-`.cwasm` that `scripts/disassemble` already wrote instead — see
-`references/tools.md`, "Profiling an existing `.cwasm`". Normalize samples by
-the number of runs the loop completed (it differs per allocator), and compare
-*guest samples per run*.
+profile. That costs seconds today; if a module ever takes regicide minutes to
+compile again, profile the `.cwasm` that `scripts/disassemble` already wrote
+instead (`references/tools.md`, "Profiling an existing `.cwasm`").
+
+**A small self-time share does not make a function cold.** hashset's
+`benchmark()` driver had 1.2-1.5% of self time, and its extra reloads cost the
+benchmark ~5 pp of cycles, because each sat right after one of its 11,190
+calls, on the critical path of the next. When a benchmark's cycles moved but
+its hot functions did not, look at the functions that *did* change (§3,
+`asm_tools.py same`), however cold, and bisect with `scripts/build-at`.
 
 **There is no block-level heat for JIT code on macOS.** `wasmtime hot-blocks`
 is Linux-only, and the per-address frames samply records for perfmap-symbolized
@@ -609,6 +693,17 @@ you want — a whole benchmark's disassembly is large and mostly irrelevant.
 
 Beware that **function numbering and ordering can differ between the two
 disassemblies**; match functions by name, not by index or offset.
+
+`asm_tools.py` (in this skill's `scripts/`) does the mechanical parts on a
+`--funcs all --addresses` disassembly: `mix` (the per-function table of
+`references/analyzing-allocation.md`), `extract N [--strip]`, `same OLD NEW`
+(which functions really changed between two builds), `loops` (innermost
+first, with line offset and a heap-offset fingerprint) and `slot2slot`.
+
+**Match loops between allocators by their heap offsets**, not by size or
+order. When regicide's version of a loop is 3-5x longer (exit stubs), the set
+of `[xN, #off]` offsets its body touches still identifies it: in 005 that
+matched all four of tinygo `countMatches`' innermost loops to ion's.
 
 **Corpus `u0-N` is not disassembly `function[N]`.** The corpus counts defined
 functions only; the disassembly's index includes imported functions. For a
@@ -672,6 +767,30 @@ covers all three hot functions and skips the rest of the module — which matter
 since a benchmark is hundreds of functions and each page is a separate compile's
 worth of rendering.
 
+### Start from the diff against the last analysis
+
+Before any per-block work, ask of each benchmark: **did its hot code change
+since the last report?** Previous reports keep their disassemblies in
+`profiles/`, so this is one command per benchmark:
+
+```bash
+S=.claude/skills/analyze-regicide-codegen/scripts
+OLD=reports/codegen-analysis-<prev>
+python3 $S/asm_tools.py same $OLD/profiles/hashset-regicide.asm $R/profiles/hashset-regicide.asm
+```
+
+and the same for the corpus inputs (`cmp` the `.postcard`s; replay both
+through the old and new `run`). In 005, keccak's, blake3's, siphashx24's,
+rust-protobuf's and hashset's hot functions were byte-identical to 003's.
+That settled three benchmarks in minutes (prior analysis stands, magnitude
+updated) and exposed hashset: identical hot code, but its cycles moved 6 pp,
+so the cause had to be elsewhere.
+
+**Do not take a moved number as a code change, or the reverse.** sqlite3
+moved from +1.46% n.s. to -5% cycles because its code changed; siphashx24
+moved from +0.73% n.s. to +1.35-2.31% significant on identical code, because
+the host was quieter.
+
 ### Start from the event counts
 
 Before reading any block, replay the hot function's corpus input with the event
@@ -683,13 +802,14 @@ RUST_LOG=regicide::region_allocation=trace,regicide::coalescing=trace \
     | grep -oE "event: [A-Za-z]+" | sort | uniq -c | sort -rn
 ```
 
-Three ratios found every mechanism in analysis 002:
+Three ratios found every mechanism in analysis 002; the fourth row is 005's:
 
 | signature | what it means |
 | --- | --- |
-| `CoalesceRefused` ≳ `SpansCoalesced`, all `Overlap` | coalescing gave up, likely `MAX_MERGE_SPANS` (known-findings §2) |
+| `CoalesceRefused` ≳ `SpansCoalesced`, or `coalesce-out-of-fuel` nonzero | coalescing gave up (known-findings §2; fixed by `efb70f6`, so this would be a regression of that fix) |
 | `BundleSplitBetweenSpans` ≫ `BundleConstructed`, nearly all `index: 1` | split peeling (known-findings §3); tally the `index:` field to check |
 | `BundleSpilledToStack` in the tens of thousands | peeled pieces finding no register; stack traffic follows |
+| `SpansCoalesced` ≫ `CoalesceRefused`, few splits, yet stack traffic far above ion's | not the allocator's core passes: look at spill-slot assignment and edge moves (005: slot-to-slot copies, known-findings §8) |
 
 Two traps in the text log:
 
@@ -784,12 +904,14 @@ Template in `references/report-templates.md`.
   warm dependencies, considerably more from cold. The scripts used to run a
   *debug* Wasmtime, which made every `wasmtime compile` painfully slow; that is
   fixed, so do not budget for it.
-- **A `wasmtime compile` is still not free**, even in release. Expect seconds
-  for a small module, minutes for `sqlite3`-class ones, and worse for a module
-  whose codegen regresses badly — `shootout-switch` took ~25 minutes to
-  disassemble under regicide, because regicide emits 5.2x the code for it. **The
-  benchmark most worth analyzing is often the one slowest to disassemble**, so
-  start that job first and in the background.
+- **`wasmtime compile` takes seconds for every `pca.suite` module** at
+  regicide `288da68` (005: tinygo-regex 6 s, sqlite3 7 s, hashset 11 s). It
+  has not always: `shootout-switch` took ~25 minutes in 001 and tinygo-regex
+  ~40 in 002, and a module whose codegen regresses badly is the one that will
+  get slow again. If a disassembly takes minutes, that is a finding, and that
+  module needs its own sightglass invocation.
+- `wasm-tools` must be on `PATH` for `scripts/profile` on a component and for
+  `scripts/time-cwasm` (`cargo install wasm-tools`).
 - `samply-text` must be on `PATH` for `scripts/profile`
   (`cargo install samply-text`); the script errors out with a hint if it is not.
 - Run every long job in the background and do the write-up of the previous step
@@ -821,8 +943,8 @@ Ordered roughly by how much they cost when hit.
 - **Writing the report at the end.** The most common way this work gets lost.
   Write continuously (see Invariants).
 - **Analyzing a host-bound benchmark.** On `pca.suite`, 97.8% of execution cost
-  is in three modules that are host-GC-bound, host-memcpy-bound, or
-  unprofilable components. Check the call tree under `array_call_native` before
+  is in three modules that are host-GC-bound, host-memcpy-bound, or an
+  unprofilable component composition. Check the call tree under `array_call_native` before
   analyzing anything (§4).
 - **Trusting `Sum Total`.** On this suite it reads +0.84% against a
   per-benchmark geomean of +20.10% — a ~24x understatement. Per-benchmark
@@ -856,10 +978,21 @@ Ordered roughly by how much they cost when hit.
   identical hot loop across a cache line. If the hot loop's instructions match
   ion's, suspect layout first.
 - **Launching sightglass on a module regicide takes 40 minutes to compile.**
-  It is paid once per process. Check compile times from §1/§4 disassembly
-  first.
+  It is paid once per process. Not a problem at present (every module
+  compiles in seconds), but check §1/§4 disassembly times before assuming so.
+- **Reading a pruned profile.** `samply-text`'s default threshold hid 76% of
+  sqlite3's guest samples; the ranking was missing its #2 function. Check
+  `guest_profile.py`'s coverage line (§4).
+- **Dismissing a function as cold because its self time is small.** hashset's
+  1.5%-self-time driver cost the benchmark ~5 pp through reloads on the path
+  of 11,000 calls. When the hot code is unchanged and the cycles are not,
+  look at what changed and bisect at runtime (`scripts/build-at`, §3).
+- **Running your own builds during a timing run.** In 005 four scratch
+  `cargo build`s launched beside a cycles run raised hashset's CV from ~5% to
+  29%, and the run had to be thrown away.
 - **Checking in-flight branches only after writing the recommendation.** The
-  user works on regicide in other branches. `git branch -a` and
+  user works on regicide in other branches, and tags dropped experiments
+  (`git tag -l 'code-quality-*'`). `git branch -a` and
   `git log --all --since=<date>` against the files you are about to blame —
   read-only — and say how your finding relates to what is in flight.
 - **Proposing a fix without checking it exists.** One session's draft
@@ -872,7 +1005,7 @@ Ordered roughly by how much they cost when hit.
   `-t`.
 - **Matching functions between disassemblies by index.** Match by name;
   numbering can differ.
-- **Letting a whole-suite corpus block the analysis.** It may not finish.
-  Per-module corpora for your actual targets are what the work needs (§3).
+- **Letting a whole-suite corpus block the analysis.** Per-module corpora for
+  your actual targets are what the work needs (§3).
 - **Drifting into step 3.** If you find yourself editing regicide, stop. Write
   the finding down instead.
