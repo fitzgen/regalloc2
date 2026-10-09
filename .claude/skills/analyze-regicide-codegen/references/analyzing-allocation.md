@@ -33,7 +33,7 @@ things worth looking for, roughly in descending order of how much they cost:
   a call, often because of a fixed-register or reuse constraint.
 - **More spill slots** than the other allocator used, i.e. a bigger frame.
 
-Count them, don't eyeball them. §"Virtual cycles" gives the arithmetic, and
+Count them, don't eyeball them. §"Estimated cycles" gives the arithmetic, and
 §"Counting, mechanically" below gives the recipe — **read it before counting
 spills on arm64**, where the obvious approach silently misses all of them.
 
@@ -108,7 +108,7 @@ For anything involving splits, evictions or live-range shapes, the HTML
 visualization is far easier to read than the log:
 
 ```bash
-./scripts/visualize -f '<function-name>' \
+./scripts/visualize -f '^u0-<N>$' \
     ~/sightglass/benchmarks/bz2/benchmark.wasm $R/viz/bz2/
 ```
 
@@ -277,13 +277,25 @@ Two follow-ups from the same parse, both of which paid off:
   edge stubs before big joins, and the cause was block parameters getting
   different spill slots from their arguments (known-findings §8). The same
   count from `run`'s printout (a `Reload` then a `Spill` of the same register
-  to a different slot) agreed exactly.
+  to a different slot) agreed exactly. Since slot classes (`3c6c16c`), check
+  whether a mismatched pair is *in the same class*: in 006, 381 of 395 were,
+  which put the fault in slot assignment (`alloc_class_slot`), not in class
+  formation.
 - **Exit stubs, not loop bodies.** When regicide's version of a loop is 3-5x
   ion's size, count only the in-loop path (header to back edge, skipping
   blocks that branch out). In 005, tinygo's loops were 43-71 instructions
   against ion's 17-24, yet every in-loop path was *shorter* than ion's; the
   bulk was 40-60-instruction stubs on the exits. That separates "the loop is
   worse" from "leaving the loop is worse", which have different causes.
+  006 summed them: edge stubs that only move values, 5,720 instructions vs
+  ion's 693 in `countMatches` (known-findings §11).
+- **Per-arm counts for a jump-table interpreter.** For a `br_table`
+  dispatch loop (sqlite3's VDBE), walk the jump table and count stack
+  accesses and moves on each arm's entry path, under both allocators. In
+  006 that turned "the VDBE has 37% more moves" into "159 of 185 arms touch
+  the stack less, 19 more; the dispatch head and latch are where regicide
+  loses". The 006 helper for this was ad hoc (it walked the first `br` and
+  its `udf`-encoded offsets); write one again if you need it.
 
 ### Matching loops between the two disassemblies
 
@@ -303,43 +315,67 @@ instruction counts become a direct proxy for dynamic cost, and the loop-depth
 weighting below does not apply. Say so in the report instead of inventing a
 block ranking.
 
-## Virtual cycles: putting a number on one block
+## Estimated cycles: putting a number on one block
 
-Instruction counts do not distinguish a register-register move from a reload,
-but the difference is roughly an order of magnitude. So for a single block,
-count operands and moves by kind and weight them. This is the metric that lets
-you say "this block got better" about a block, rather than about a benchmark.
+Instruction counts do not distinguish a register-register move from a reload.
+So for a single block, count operands and moves by kind and weight them. This
+is the metric that lets you say "this block got better" about a block, rather
+than about a benchmark.
+
+**Use regicide's own cost model**, the one `regicide/examples/run.rs` prints as
+`estimated-cycles` (`struct EstimatedCycles`), so a block you count by hand
+and a function `run` counts are in the same units:
 
 | Thing | Cost |
 | --- | --- |
 | Register operand | 1 |
 | Register-register move | 1 |
-| Stack-slot operand | 10 |
-| Move that touches the stack (spill or reload) | 10 |
-
-Sum over the block, for each allocator. Lower is better.
+| Remat (a constant rematerialized into a register) | 1 |
+| Stack-slot operand | 5 |
+| Spill or reload (a move that touches the stack) | 5 |
 
 ```
-virtual_cycles = reg_operands + reg_moves + 10 * (stack_operands + spills + reloads)
+estimated_cycles = reg_operands + reg_moves + remats
+                   + 5 * (stack_operands + spills + reloads)
 ```
 
-The weights are deliberately crude — they encode "memory is about ten times a
-register" and nothing more. They are for **comparing two allocations of the same
-block**, not for predicting absolute performance. Do not carry a virtual-cycle
-number across blocks or sum it over a function; it means nothing there.
+`run` multiplies each block's counts by the **block weight**: 10x per
+enclosing loop, times the block frequency's `estimate_weight` (0.05 at
+`COLD`, 1 at `NORMAL`, 10 at `HOT`). **For one basic block of assembly
+in isolation, ignore the weight**: count at weight 1, and say in prose which
+loop the block is in. Apply the weight only when you add up blocks at
+different depths, for example an in-loop path plus its exit stubs.
+
+`scripts/estimated_cycles.py FUNC.asm START-END ...` counts over an address
+range of the disassembly at weight 1. On arm64 it treats any load or store
+addressed off `[sp` as a stack access (cost 5; an `stp`/`ldp` pair counts as
+two), a register-register `mov` as a move, a `mov` of an immediate as a
+remat, and everything else as one per register operand.
+
+The weights are deliberately crude: memory is about five times a register,
+and nothing more. They are for **comparing two allocations of the same
+block**, not for predicting absolute performance.
 
 Two refinements worth applying when they matter:
 
-- **Weight by loop depth.** A block in a doubly-nested loop executes far more
-  often than the function entry. If the block is in a loop and the other
-  candidate block is not, say so — the raw virtual cycles understate it.
-- **Dynamic, not static.** The profile tells you how hot the block actually is.
-  Ten virtual cycles saved in the hottest block beats a hundred saved in a block
-  with two samples.
+- **Say the loop depth.** A block in a doubly-nested loop runs ~100x as often
+  as the function entry in regicide's own model. If the block is in a loop
+  and the other candidate block is not, say so.
+- **Dynamic, not static.** The profile tells you how hot the block actually
+  is. Ten estimated cycles saved in the hottest block beats a hundred saved
+  in a block with two samples.
 
-Record the count in the per-block analysis as a small table, both allocators
-side by side, with the operand and move counts it was derived from so the
-arithmetic is checkable.
+Record the count in the per-block analysis as a small table, both
+allocators side by side, with the operand, move and stack counts it was
+derived from so the arithmetic is checkable.
+
+**Estimated cycles can get the direction wrong, like `insts-retired`.** On
+keccak's straight-line block (006) regicide scored +3.4% (with the earlier
+10x stack weight; still positive at 5x) and was -1.2% on cycles. Ion's
+store-then-reload-within-4-instructions pairs (33 of them) stall on
+store-to-load forwarding, and the weights cannot see that. Count those pairs
+separately when a block is straight-line and memory-heavy. Wall time decides;
+an estimate only explains it.
 
 ---
 
@@ -360,7 +396,7 @@ up; yours come from the tools.)
 > | reg-reg moves | 2 | 1 |
 > | stack operands | 0 | 0 |
 > | spills + reloads | 0 | 2 |
-> | **virtual cycles** | **16** | **34** |
+> | **estimated cycles** | **16** | **24** |
 >
 > The block is the innermost loop body, so the two memory touches are paid every
 > iteration.

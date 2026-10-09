@@ -24,55 +24,61 @@ This is the file the user actually reads. Everything else is evidence for it.
 N = 5
 
 regicide (candidate) vs regalloc2 backtracking/ion (baseline). Counts are
-instructions or cycles, so lower is faster. Deltas are (regicide - ion) / ion:
+cycles or instructions, so lower is faster. Deltas are (regicide - ion) / ion:
 **negative means regicide is faster** (-12% = 12% fewer), positive means
 slower.
 
 ## Top line
 
-| | insts-retired | cycles |
-| --- | --- | --- |
-| geomean | -0.54% | inconclusive |
-| significantly faster | 4 | 1 |
-| significantly slower | 3 | 0 |
-| no difference | 34 | 40 |
-| `Sum Total` | -0.79% (significant) | -0.3% (not significant) |
+Wall time (sightglass `cycles`, `-i 60` on all 14, `-i 90` on 5) decides.
+Instructions retired is shown beside it as a diagnostic only.
 
-Ranking is by `insts-retired`, which resolves; cycles was run at `-i 30` on the
-ten benchmarks below and resolved only `hashset`. <!-- Say this plainly rather
-than implying cycles backed the whole ranking. -->
+| | **cycles** | insts-retired (diagnostic) |
+| --- | --- | --- |
+| geomean | **-0.8%** | +2.3% |
+| significantly faster | **5** | 3 |
+| significantly slower | **2** | 7 |
+| no difference / inconclusive | 7 | 4 |
+
+<!-- Name every benchmark where the two disagree in direction, and the trade
+     behind it, in a sentence: "regicide runs more instructions but less time
+     on sqlite3, keccak and blake3: fewer stack accesses, more register
+     moves." Never headline the instruction column. Never quote `Sum Total`. -->
 
 Raw data: `sightglass-data/`. Commands: `misc/commands.md`.
 
 ## Static allocation quality, suite-wide
 
-From `run.rs` over the whole-suite corpus (`misc/corpus-counts.txt`), 17
-modules / 4,812 functions. These are the numbers a change in step 3 should move.
+From `run -q` over the whole-suite corpus (`corpus/`, required; SKILL.md §3):
+`misc/corpus-counts.txt` and `misc/corpus-counts-by-module.txt`, 17 modules
+/ 6,416 functions. These are the numbers a change in step 3 should move.
 
-| | regicide |
-| --- | --- |
-| reg-reg moves | 38,114 |
-| spills | 9,220 |
-| reloads | 12,678 |
-| remats | 1,904 |
-| critical edges | 3,355 |
-| spill slots | 14,702 |
+| | suite total |
+| --- | ---: |
+| reg-reg moves (of which cold) | 210,177 (8,054) |
+| spills | 23,656 |
+| reloads | 71,911 |
+| remats | 21,862 |
+| spill slots | 8,658 |
+| estimated cycles | 103,351,088 |
+| `coalesce-out-of-fuel` | 0 |
+
+Then one row per module, all 17, same columns.
 
 <!-- There is no `run.rs` for regalloc2's backtracking allocator, so this column
      stands alone: it is a baseline for future regicide runs, not a comparison.
      Say so rather than leaving a reader to assume a comparison. -->
 
 
-## Every benchmark with a significant difference
+## Every benchmark with a significant difference in wall time
 
-Largest slowdown first.
+Largest slowdown first, by cycles. The instruction column is a diagnostic.
 
-| benchmark | insts-retired | cycles | analyzed |
-| --- | --- | --- | --- |
-| `blake3-scalar/benchmark` | +10.93% | n.s. | [regressions/blake3-scalar.md](regressions/blake3-scalar.md) |
-| `quicksort/benchmark` | +6.13% | n.s. | [regressions/quicksort.md](regressions/quicksort.md) |
-| … | | | |
-| `hashset/benchmark` | -12.06% | -9.1% | [improvements/hashset.md](improvements/hashset.md) |
+| benchmark | cycles | robust? | insts-retired | analyzed |
+| --- | ---: | --- | ---: | --- |
+| `tinygo/tinygo-regex` | **+21.4%** | yes | +17.0% | [regressions/tinygo-regex.md](regressions/tinygo-regex.md) |
+| … | | | | |
+| `sqlite3` | **-4.2%** | yes | +6.0% (more insts, less time) | [improvements/sqlite3.md](improvements/sqlite3.md) |
 
 ## Top 5 things to fix
 
@@ -88,7 +94,8 @@ block that barely sampled.
 - **Where:** `regicide/src/region_allocation.rs`, the eviction cost comparison.
 - **Seen in:** `bz2` (hottest block, 41% of samples), `regex` (2 blocks),
   `blake3-scalar` (hottest block). **3 of 5 benchmarks analyzed.**
-- **Cost where measured:** +18 virtual cycles in `bz2`'s innermost loop body.
+- **Cost where measured:** +3.1% cycles on `bz2` (wall time, `-i 60`,
+  robust); +8 estimated cycles in its innermost loop body.
 - **Evidence:** [regressions/blake3-scalar.md](regressions/blake3-scalar.md) §Block 3.
 
 ### 2. …
@@ -110,10 +117,30 @@ Wins get recorded precisely because the next change can silently undo them.
 ## Caveats
 
 <!-- Be explicit. Anything the reader would otherwise have to guess:
-     - cycles inconclusive on N of M benchmarks
+     - benchmarks whose wall time stayed inconclusive at -i 90, with the
+       estimators' spread
      - benchmarks skipped and why
      - functions where fewer than 3 hot functions/blocks existed
      - anything that looked wrong and was not run to ground -->
+
+## Compile time vs ion
+
+<!-- Last section, written after everything above (SKILL.md §7). A table and
+     a pointer to the raw data. No analysis, no profiles, no explanations. -->
+
+Instructions retired in sightglass's compilation phase (`-p compilation
+-m insts-retired -i 5`), whole `pca.suite`, same Wasmtime build for both
+allocators. Lower is faster; delta is (regicide - ion) / ion. Raw data:
+[`sightglass-data/compile-insts-retired.csv`](sightglass-data/compile-insts-retired.csv);
+ranking: [`sightglass-data/compile-ranking.txt`](sightglass-data/compile-ranking.txt).
+
+geomean **+531%**; significantly slower 17 of 17, faster 0.
+
+| benchmark | ion | regicide | delta | significant |
+| --- | ---: | ---: | ---: | --- |
+| `shootout/shootout-switch` | 3,807,357,489 | 414,129,598,658 | +10,777% | yes |
+| `tinygo/tinygo-regex` | 4,191,930,551 | 73,746,094,534 | +1,659% | yes |
+| … | | | | |
 ```
 
 ---
@@ -124,41 +151,45 @@ One per benchmark, same shape for both directions.
 
 Four rules specific to these files:
 
-1. **Name both metrics in the title when they disagree**, e.g.
-   `+2.23% instructions but -7.38% cycles`. A title quoting only the
-   instruction delta misdescribes the benchmark.
-2. **If the `cycles` row is still pending, the prose must not characterize
-   severity.** Write the mechanism — what differs, why the allocator did it,
-   what in its design led there — and leave the "how bad is it" sentence until
-   cycles lands. In one session three per-benchmark reports had to be revised
-   because severity was written from instruction counts.
+1. **Title with the cycles delta.** When instructions disagree in
+   direction, name both: `-4.2% cycles despite +6.0% instructions`. A title
+   quoting only the instruction delta misdescribes the benchmark.
+2. **Severity comes only from cycles.** Write the mechanism — what differs,
+   why the allocator did it, what in its design led there — with
+   instruction, move, stack-access and estimated-cycle counts as evidence.
+   Every "how bad is it" sentence quotes the cycles result. If cycles was
+   inconclusive, say so; do not write a severity from instructions.
 3. **Every delta uses the sign convention** (SKILL.md): `(variant - baseline)
    / baseline`, negative = faster. When a table compares two runs or two
    regicide revisions rather than ion vs regicide, name the baseline in the
    column header (e.g. `moves, 630ca5e → 2a56dbe`).
-4. **Say whether the hot code changed since the last analysis**, near the top,
-   with the evidence (`asm_tools.py same`, corpus `cmp`, replay counts). If
-   it is byte-identical, link the previous report's analysis rather than
-   redoing it, and spend the file on what *is* new: the measurement, and any
-   function that did change. In 005, five benchmarks were settled this way,
-   and the one whose hot code was identical but whose cycles moved (hashset)
-   turned out to be the most informative report of the run. Two benchmarks
-   with identical hot code and the same verdict can share one file
-   (005: `regressions/keccak-and-blake3.md`).
+4. **Say whether the hot code changed since the last analyzed regicide
+   revision**, near the top, with this run's evidence: `asm_tools.py same`
+   on `$R/bisect/` builds made with `scripts/build-at` at that revision and
+   at HEAD. **Do not link or quote an earlier report**; reports are
+   standalone (SKILL.md, Invariants). If the hot code is unchanged, say so
+   and keep the analysis short, but make it self-contained: the mechanism in
+   a paragraph, with this run's disassembly and counts. Spend the rest of
+   the file on what *is* new: the measurement, and any function that did
+   change. A benchmark whose hot code is identical but whose cycles moved is
+   usually the most informative report of the run (hashset in 005: the
+   cause was a cold-looking driver function). Two benchmarks with the same
+   mechanism and verdict can share one file.
 
-A benchmark can also belong in `regressions/` by instruction count while being
-a *win* on cycles. Keep it where the ranking put it, and say so plainly at the
-top rather than silently filing it under the other direction.
+File each benchmark by its **cycles** result: `regressions/` if regicide is
+significantly slower in wall time, `improvements/` if faster. A benchmark that
+runs more instructions in less time is an improvement; its file should explain
+the trade.
 
 ````markdown
-# <benchmark> — regicide <-12.06% / +10.93%>
+# <benchmark> — regicide <-9.1%> cycles
 
 **2026-09-30, 15:04**
 
 | metric | backtracking | regicide | delta | significant |
 | --- | --- | --- | --- | --- |
-| insts-retired | 900,271 | 791,710 | -12.06% | yes |
-| cycles (`-i 30`) | 412,003 | 374,551 | -9.1% | yes |
+| **cycles** (`-i 60` + `-i 90`, pooled) | 412,003 | 374,551 | **-9.1%** | yes, robust |
+| insts-retired (diagnostic, `-i 5`) | 900,271 | 791,710 | -12.06% | yes |
 
 <!-- When cycles resolved and disagrees in direction or magnitude, say so here
      in a sentence, with the robust estimators (median / trimmed / minimum) so
@@ -177,11 +208,12 @@ Profiles: `../profiles/hashset-regicide.txt`,
 
 Render the HTML visualizations of regicide's allocations for this benchmark's
 hot functions. The `-f` filter is a case-insensitive POSIX extended regex over
-function names, so one `|`-joined invocation covers all of them at once:
+*capture* names, which are the corpus placeholders `u0-N` (work out `N` from
+the import offset), so one `|`-joined invocation covers all of them at once:
 
 ```bash
 cd ~/regalloc2
-./scripts/visualize -f '<hot-fn-1>|<hot-fn-2>|<hot-fn-3>' \
+./scripts/visualize -f '^u0-(<N1>|<N2>|<N3>)$' \
     ~/sightglass/benchmarks/hashset/benchmark.wasm \
     reports/codegen-analysis-NNN/viz/hashset/
 ```
@@ -256,16 +288,18 @@ corpus replay for the backtracking allocator, see `references/tools.md`):
  reasoning can still use the evidence>
 ```
 
-**Virtual cycles** (weights: register operand or reg-reg move = 1; stack operand
-or stack-touching move = 10):
+**Estimated cycles**, regicide's cost model at weight 1 (register operand,
+reg-reg move or remat = 1; stack operand, spill or reload = 5;
+`scripts/estimated_cycles.py`):
 
 | | backtracking | regicide |
 | --- | --- | --- |
 | register operands | 14 | 13 |
 | reg-reg moves | 2 | 1 |
+| remats | 0 | 0 |
 | stack operands | 0 | 0 |
 | spills + reloads | 2 | 0 |
-| **virtual cycles** | **36** | **14** |
+| **estimated cycles** | **26** | **14** |
 
 **Level 1 — what differs.** …
 

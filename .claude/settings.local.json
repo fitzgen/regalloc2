@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n 'regicide`\\\\?/\\\\|~/regicide\\\\|path = \\\\|\\\\.gitignore\\\\|workspace' 02-regalloc2-integration.md)",
+      "Bash(grep -E ': OperandConstraint|:\\\\s*Option<OperandConstraint>|OperandConstraint,$|-> OperandConstraint')"
+    ]
+  }
+}

@@ -8,7 +8,8 @@ interesting. This reads the machine-readable output of
     sightglass-cli effect-size -f sightglass-data.csv -i csv -o csv > es.csv
 
 ranks every benchmark from worst regression to largest win, and prints the top N
-each way as `.wasm` paths ready to paste into a confirmation run.
+each way. Run it on cycles for execution (the ranking that picks what to
+analyze), and on instructions retired for the compilation phase (SKILL.md 7).
 
 No statistics are re-derived here. Sightglass computes a Behrens-Fisher
 confidence interval on the difference of means and calls a result significant
@@ -274,10 +275,13 @@ def report(group, entries, top, show_all):
     for e in best or [None]:
         print(f"    {e['bench']:<48} {e['delta_pct']:+.2f}%" if e else "    (none)")
 
+    # Only instruction counts of execution need a wall-time confirmation:
+    # cycles is already the verdict, and compile time is reported as
+    # instructions retired (SKILL.md, sections 2 and 7).
     picks = [e["path"] for e in worst + best]
-    if picks:
-        print("\n  confirm these with cycles, at a high sample count:\n")
-        print("    ./scripts/sightglass -m cycles -i 30 \\")
+    if picks and phase.lower() == "execution" and event.lower() != "cycles":
+        print("\n  instructions are a diagnostic; get these benchmarks' cycles:\n")
+        print("    ./scripts/sightglass -m cycles -i 60 \\")
         for i, p in enumerate(picks):
             tail = " \\" if i < len(picks) - 1 else ""
             print(f"        {p}{tail}")

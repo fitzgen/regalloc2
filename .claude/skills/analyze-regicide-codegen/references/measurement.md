@@ -11,77 +11,83 @@ appear as `regicide` and `backtracking` in the CSV.
 
 ---
 
-## The two metrics
+## The two metrics, and which one decides
 
-### `insts-retired` — the screen
-
-Native instructions retired. Quiet: differences of a fraction of a percent are
-resolvable with 3 samples, which is why it is `scripts/sightglass`'s default.
-
-Its blind spot is exactly the thing this analysis is about: **it cannot tell a
-register-register move from a reload.** Both are one instruction; one touches
-memory and costs roughly ten times as much. An allocator change that converts
-three reloads into three register moves is a real win that `insts-retired` scores
-as *zero*.
-
-So it is a good **ranking** instrument and a bad **verdict**.
-
-### `cycles` — the verdict
+### `cycles` — the ranking and the verdict
 
 Elapsed ticks of a fixed-rate timer around the phase (on arm64 macOS the ~24MHz
 `cntvct_el0` virtual counter), i.e. wall-clock latency in ticks. It is what we
 actually care about, and it does see the memory traffic.
 
-It is also **much noisier**, and for the small differences a register allocator
-produces it frequently cannot resolve them at all. That is the central tension
-of this skill, and the honest answer is often "cycles was inconclusive".
+It is also **noisy**, and the differences a register allocator produces are
+small, so it needs many samples: **`-i 60` to rank, `-i 90` to confirm**.
+At the old `-i 30`, 006 left rust-protobuf unresolved, flipped blake3 and
+hash3 between "no difference" and "significant", and pinned hashset's size
+only to within a factor of three.
+
+### `insts-retired` — a diagnostic
+
+Native instructions retired. Quiet: differences of a fraction of a percent
+are resolvable with 3-5 samples, and it is insensitive to host load.
+
+Its blind spot is exactly the thing this analysis is about: **it cannot tell
+a register-register move from a reload.** Both are one instruction; one
+touches memory. Regicide's design trades reloads for register moves, so it
+regularly runs **more instructions in less time**:
+
+| benchmark (006) | insts-retired | cycles |
+| --- | ---: | ---: |
+| `sqlite3` | +5.96% | -3.8% to -4.6% |
+| `shootout-keccak` | +8.75% | -1.2% to -1.3% |
+| `blake3-scalar` | +5.23% | -0.2% to -0.3% |
+
+and occasionally the reverse (005, hashset: -3.93% instructions, +5%
+cycles, from reloads after calls). So it never ranks benchmarks and never
+states a cost. What it is good for: **where it disagrees with cycles, there
+is a moves-for-memory trade in that benchmark**, and the per-benchmark report
+should find and quantify it (stack accesses, moves, estimated cycles).
 
 ### The policy
 
-**Screen with `insts-retired`; confirm with `cycles` — and launch the cycles run
-early, not as a closing formality.** Spending 30 iterations of cycles on 40
-benchmarks to read 10 of them is waste, but so is writing up severity from
-instruction counts and then having to revise it.
-
-The order that avoids both, now that every module compiles in seconds
-(005: the 14-benchmark `-i 5` screen in ~3 minutes, `-i 30` cycles on 8 in ~2):
+**Rank by `cycles` on every benchmark, from the start.** Every module
+compiles in seconds, so there is no reason to screen with a cheaper metric:
+the 14-benchmark suite at `-i 60` is a few minutes. The previous policy
+(screen by instructions, confirm a subset with cycles) filed cycles wins as
+regressions and spent its sample budget on benchmarks chosen by the wrong
+metric.
 
 ```bash
-# 1. The whole screen (suite minus host-bound modules; SKILL.md §2).
-./scripts/sightglass -i 5 $(sed 's|^|benchmarks/|' $R/sightglass-data/screen.suite) \
-    > $R/sightglass-data/screen-insts-retired.csv
+# 1. The ranking (suite minus host-bound modules; SKILL.md §2).
+./scripts/sightglass -m cycles -i 60 $BENCHES -- --pin \
+    > $R/sightglass-data/cycles.csv
 
-# 2. Cycles on every benchmark that ranked significant, either direction,
-#    BEFORE the deep analysis.
-./scripts/sightglass -m cycles -i 30 <picks> -- --pin \
-    > $R/sightglass-data/confirm-cycles.csv
+# 2. -i 90 on whatever scripts/cycles_robustness.py calls NOISY or MIXED,
+#    on anything not significant whose estimators agree in sign, and on
+#    anything you will build a finding on.
+./scripts/sightglass -m cycles -i 90 <those> -- --pin \
+    > $R/sightglass-data/cycles-confirm.csv
 
-# 3. -i 45 on whatever scripts/cycles_robustness.py calls NOISY or MIXED,
-#    and on any benchmark where the two metrics disagree in direction.
-./scripts/sightglass -m cycles -i 45 <those> -- --pin \
-    > $R/sightglass-data/confirm2-cycles.csv
+# 3. The diagnostic, same benchmarks.
+./scripts/sightglass -i 5 $BENCHES > $R/sightglass-data/insts-retired.csv
 ```
 
-If compile time ever makes the full screen slow again, screen five or six
-small Wasm-bound benchmarks first so target selection does not wait on it.
-Observed agreement between such a subset and the full screen (001):
-`shootout-sieve` **+2.23% in both**, `shootout-keccak` +11.00% / +11.06%.
+If cycles does not resolve for a benchmark even at `-i 90`, **say its wall
+time is inconclusive**, give the spread of the robust estimators, and leave
+it out of the improved/regressed picks. Do not rank it by instructions
+instead, and do not promote a noisy cycles number to a finding.
 
-A benchmark can be *significant* at `-i 5` and *insignificant* at `-i 3`
-purely on sample count (`shootout-heapsort`, +15.06% vs +12.72%). Take the
-higher-sample number; the low-power run understated a real regression.
+**Compile time is the exception** (SKILL.md §7). There, `insts-retired` is
+the metric: compilation has no move-vs-memory trade to hide, so retired
+instructions track compile wall time and are quiet enough for `-i 5`.
 
-If cycles does not resolve, **say so in the report** and rank by
-`insts-retired`. Do not promote a noisy cycles number to a finding, and do not
-quietly drop the metric you said you would measure.
+### Separate mechanism from magnitude
 
-### Separate mechanism from magnitude, and do not state severity before cycles
-
-**The most expensive mistake available here.** `insts-retired` is an excellent
-*mechanism detector* — quiet enough to rank 17 benchmarks at `-i 3`, and it
-pointed straight at every real mechanism in the last full run. It is a **bad
-cost estimator** for a register allocator, because the difference is usually
-register-register moves, which is precisely its blind spot.
+**The most expensive mistake available here** is writing a cost from
+instruction counts. `insts-retired` is a good *mechanism detector*: where it
+moves, something in the code changed. It is a **bad cost estimator** for a
+register allocator, because the difference is usually register-register
+moves, which is precisely its blind spot. The cost is the cycles number;
+everything else is evidence for the mechanism.
 
 What one session (001) actually measured, with what 002 measured five days
 later in brackets:
@@ -129,7 +135,7 @@ points. Four cheap checks, all from the raw CSV, which
 
 ```bash
 python3 .claude/skills/analyze-regicide-codegen/scripts/cycles_robustness.py \
-    $R/sightglass-data/confirm-cycles.csv
+    $R/sightglass-data/cycles.csv $R/sightglass-data/cycles-confirm.csv
 ```
 
 It reports mean, median, 20%-trimmed mean and minimum-to-minimum (negative =
@@ -151,6 +157,13 @@ This is what distinguished the real results from the noise in that session:
 - 005, `hashset` +5.19% / +4.20% (two runs): CV 4-7%, median and trimmed mean
   +3 to +5% in both; then +6.19% with 64-byte function alignment. Real, and
   not layout.
+- 006, `hashset` -6.79% / -4.78% / -3.27% aligned: `NOISY` in all three
+  (regicide CV 6-10%), estimators from -0.5% to -15.8%, but every one
+  negative. Reported as "a win of uncertain size", which is the honest
+  framing when the sign is robust and the size is not.
+- 006, `rust-protobuf` -1.12% n.s. then +0.55% n.s. (`MIXED`: mean positive,
+  median negative). Inconclusive on cycles; the instruction win stands
+  alone.
 
 Quote the minimum-to-minimum figure when a result matters — it is the most
 conservative framing and the least contaminated by scheduler noise.
@@ -171,6 +184,10 @@ Note the disagreement and go look at the code; that is where the finding is.
 In 005 both kinds appeared and were the run's headline: sqlite3 (+6.28%
 insts, -5% cycles; 29% fewer stack accesses) and hashset (-3.93% insts, +5%
 cycles; ~3,400 extra reloads each right after a call).
+In 006 three of the five worst benchmarks by instructions were cycles wins
+or parity: sqlite3 (+5.96% / -4%), keccak (+8.75% / -1.2%), blake3 (+5.23% /
+-0.3%). Run cycles on *every* significant benchmark, not only the top `N`
+each way, or a ranking by instructions files wins as regressions.
 
 **Rule out layout** before attributing either to the allocator: re-run with
 `-C cranelift-log2_min_function_alignment=6` passed to both engines (SKILL.md
@@ -209,9 +226,13 @@ without re-measuring:
 ```bash
 cd ~/sightglass
 cargo run --release -q -- effect-size \
-    -f ~/regalloc2/$R/sightglass-data/screen-insts-retired.csv -i csv -o csv \
-    > ~/regalloc2/$R/sightglass-data/screen-effect-size.csv
+    -f ~/regalloc2/$R/sightglass-data/cycles.csv \
+    -f ~/regalloc2/$R/sightglass-data/cycles-confirm.csv -i csv -o csv \
+    > ~/regalloc2/$R/sightglass-data/cycles-effect-size.csv
 ```
+
+Several `-f` files pool their samples, which is how a benchmark's `-i 60` and
+`-i 90` runs combine into one verdict.
 
 Output columns:
 
@@ -224,8 +245,11 @@ Then rank it:
 
 ```bash
 python3 ~/regalloc2/.claude/skills/analyze-regicide-codegen/scripts/rank_benchmarks.py \
-    ~/regalloc2/$R/sightglass-data/screen-effect-size.csv --top 5
+    ~/regalloc2/$R/sightglass-data/cycles-effect-size.csv --top 5 --all
 ```
+
+Its "confirm these with cycles" footer predates ranking by cycles; when the
+input is already cycles, ignore it.
 
 Drop `-o csv` for a human-readable comparison, which prints one block per
 `phase :: event :: benchmark` with a Min/Max/Mean/Median table per engine.
@@ -244,9 +268,9 @@ the raw `effect-size` CSV, check which engine landed in `a_engine` before
 calling anything a win — `effect-size` emits each pair once, in an order it
 chooses. Getting this backwards inverts the entire report.
 
-**Analysis 001's report files use the opposite sign** (positive = faster).
-The numbers quoted from it in this skill have been converted; the files in
-`reports/codegen-analysis-001/` have not.
+**Analysis 001 used the opposite sign** (positive = faster). Numbers from it
+quoted in this skill have been converted. Its report directory, like 002-005,
+has been deleted, so the quoted numbers are the only record.
 
 ### 2. Significance
 
@@ -318,9 +342,13 @@ phase measures once per process.
 
 | Use | Flags | Why |
 | --- | --- | --- |
-| Screening the suite | default (`-i 3`, `insts-retired`) | Instruction counts are quiet; 3 is enough to rank. |
-| Confirming the extremes | `-m cycles -i 30` | Cycles needs the samples. |
-| A result you doubt | `-m cycles -i 60` or more | A lone "significant" result at low sample count can be a fluke that vanishes. Re-confirm before believing it. |
+| **Ranking execution** (every benchmark) | `-m cycles -i 60 -- --pin` | Wall time decides. Double the `-i 30` this skill used to use, which left three of ten benchmarks unresolved or flipping in 006. |
+| **Confirming** (`NOISY`, `MIXED`, near-significant, or anything a finding rests on) | `-m cycles -i 90 -- --pin` | Pool with the `-i 60` samples in `effect-size`. |
+| Execution diagnostic | `-i 5` (`insts-retired`) | Quiet; locates moves-for-memory trades. Never ranks. |
+| **Compile time** (SKILL.md §7) | `-p compilation -i 5` (`insts-retired`) | Quiet, and a good proxy for compile wall time, since compilation has no move-vs-memory trade. |
+
+`scripts/sightglass`'s own default for `-m cycles` is still `-i 30`, so
+always pass `-i` explicitly.
 
 Pass `--pin` through (`-- --pin`) to bind each process's iterations to one core,
 which cuts scheduling noise. On Apple Silicon the affinity API is advisory, so
@@ -364,7 +392,7 @@ any number you copy from it into a report:
 
 ```bash
 python3 ~/.claude/skills/optimize-cranelift-codegen/scripts/check_no_pessimization.py \
-    $R/sightglass-data/screen-effect-size.csv \
+    $R/sightglass-data/cycles-effect-size.csv \
     --baseline backtracking --candidate regicide
 ```
 
@@ -380,16 +408,18 @@ tool for choosing what to analyze.
 
 Sightglass compiles the module once per measured process, so a module regicide
 compiles slowly multiplies straight into the run: in 002, tinygo-regex took
-~40 minutes per compile, so a `-i 5` screen spent ~80 minutes on it alone and a
-`-i 30` cycles run would have taken ~7 hours. **At regicide `288da68` (005)
-every `pca.suite` module compiles in seconds**, so this no longer shapes the
-plan. Keep an eye on §1/§4 disassembly times anyway: a module that suddenly
-takes minutes is both a scheduling problem and, usually, a codegen finding.
+~40 minutes per compile, so a `-i 5` run spent ~80 minutes on it alone and a
+`-i 30` cycles run would have taken ~7 hours. **At regicide `cf70ddd` (006)
+every module analyzed compiled in 3-9 s**, so `-i 60` and `-i 90` cycles runs
+are affordable. Keep an eye on §1/§4 disassembly times anyway: a module that
+suddenly takes minutes is a scheduling problem. Do not analyze it, though:
+compile time is tabulated in SKILL.md §7, not explained.
 
 ## Bookkeeping
 
 Keep every raw CSV under `$R/sightglass-data/`, named for what it is
-(`screen-insts-retired.csv`, `confirm-cycles.csv`), so every number in the
+(`cycles.csv`, `cycles-confirm.csv`, `insts-retired.csv`,
+`compile-insts-retired.csv`), so every number in the
 report can be re-derived without re-measuring.
 
 Record in `$R/misc/measurement-notes.md`: host OS and arch, date, the suite, the

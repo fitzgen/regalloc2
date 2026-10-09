@@ -167,8 +167,7 @@ samply-text record -t -n 250 -- /tmp/loopdrv 15 \
 The two allocators complete different numbers of runs in the same window, so
 compare **guest samples per run** (`array_to_wasm_trampoline` total ÷
 `loop-driver: N runs`), not raw samples. Guest frames symbolize via the
-perfmap even without line tables. A copy of both files is in
-`reports/codegen-analysis-002/misc/tools/`.
+perfmap even without line tables.
 
 **Do not try to get per-address heat from samply's raw JSON.** The `address`
 recorded for a perfmap JIT frame is offset from the real address by a constant
@@ -294,6 +293,21 @@ A component disassembles fine; each core module's functions are prefixed
 Stack accesses use the narrow filter (single register to `[sp`), so
 prologue `stp`/`ldp` pairs are not counted.
 
+### `estimated_cycles.py` — estimated cycles over a path
+
+```
+python3 .claude/skills/analyze-regicide-codegen/scripts/estimated_cycles.py FUNC.asm START-END [START-END ...]
+```
+
+Regicide's estimated cycles (the cost model `run` prints;
+`references/analyzing-allocation.md`) over the concatenation of inclusive
+hex address ranges: a loop's in-loop path, an exit stub, one opcode arm.
+Every instruction counts at block weight 1, since disassembly carries no
+loop depth or frequency. Prints instructions, register operands, reg-reg
+moves, immediate `mov`s (remats), stack accesses and the total. **It counts
+any `[sp` operand**, with `stp`/`ldp` as two, so on a range that holds a
+prologue it reports more stack accesses than `asm_tools.py`'s narrow filter.
+
 ---
 
 ## `scripts/log` — see the allocator's decisions
@@ -375,7 +389,7 @@ something you can actually navigate — use it when the textual log is too much.
 
 | Flag | Notes |
 | --- | --- |
-| `-f`, `--filter FUNC` | Only visualize functions whose name matches this POSIX extended regex (case-insensitive). **Use it** — a whole benchmark is hundreds of functions. |
+| `-f`, `--filter FUNC` | Only visualize captures whose name matches this POSIX extended regex (case-insensitive). **Use it** — a whole benchmark is hundreds of functions. The name is the capture's, which is the corpus placeholder `u0-N` for every `pca.suite` module checked in 006 (tinygo-regex included), so filter `-f '^u0-(99\|229)$'`, not by function name: a name filter silently renders nothing. |
 
 Anything after `--` goes to `wasmtime compile`.
 
@@ -424,19 +438,12 @@ gets a `-2` suffix.
 **Pass every module you want in one invocation**, since it builds Wasmtime once
 and then compiles each in turn.
 
-**But prefer a per-module corpus for analysis work.** The whole-suite corpus is
-a Wasmtime compile per module and the big ones (`sqlite3`, `spidermonkey`,
-`shootout-switch`) are slow; a whole-suite run can exceed an hour and may not
-finish. A single small module takes a couple of minutes. One directory per
-module also keeps provenance unambiguous:
-
-```bash
-./scripts/make-corpus -c $R/corpus-heapsort \
-    ~/sightglass/benchmarks/shootout/shootout-heapsort.wasm
-```
-
-Build the whole-suite corpus only if you actually want the suite-wide static
-baseline, and treat it as a background job that may not land.
+**The skill builds one corpus per run, of the whole suite, into `$R/corpus/`**
+(SKILL.md §3, required). For `pca.suite` at regicide `cf70ddd` that is 11
+minutes and 6,416 inputs. A capture is byte-identical whether the module was
+built alone or with the rest of the suite, so per-module corpus directories
+add nothing; select one module's inputs with a glob,
+`$R/corpus/<module>-[0-9]*.postcard`.
 
 It exits nonzero if any module captured nothing, which usually means a cache hit
 — the script passes `-C cache=n`, so this should not happen, but check for it.
@@ -458,7 +465,7 @@ far the most moves or spills):
 
 ```bash
 cargo run --manifest-path regicide/Cargo.toml --all-features --example run \
-    -q -- -q $R/corpus-heapsort | grep -B1 -E "moves [0-9]{3,}"
+    -q -- -q $R/corpus/shootout-heapsort-[0-9]*.postcard | grep -B1 -E "moves [0-9]{3,}"
 ```
 
 ### Replaying with `run.rs`
@@ -469,9 +476,11 @@ cargo run --manifest-path regicide/Cargo.toml --all-features --example run -- [O
 
 A path is either a directory (every `*.postcard` and `*.json` directly in it,
 sorted, so two runs over one corpus can be diffed) or a single input file. The
-encoding is detected from the file's contents rather than its name, so a corpus
-captured before `make-corpus` wrote postcard -- such as
-`reports/codegen-analysis-001/corpus-keccak/` -- still replays unchanged.
+encoding is detected from the file's contents rather than its name, so an
+old JSON corpus still replays. **The input format itself changes between
+regicide revisions**, though: a `run` built at `288da68` cannot read a corpus
+captured at `cf70ddd` (`1db4308` changed the input). Rebuild the corpus, or
+compare revisions at runtime with `scripts/build-at` (SKILL.md §3).
 
 | Flag | Notes |
 | --- | --- |
@@ -547,7 +556,7 @@ input, render directly:
 ```bash
 cargo build --manifest-path regicide/Cargo.toml --release --example visualize \
     --features visualizer,test-utils,deserialize
-regicide/target/release/examples/visualize --input $R/corpus-X/<fn>.postcard \
+regicide/target/release/examples/visualize --input $R/corpus/<module>-<NNNN>-u0-<N>.postcard \
     $R/viz/<bench>/<fn>.html
 ```
 
@@ -560,7 +569,7 @@ information `scripts/log` gives you, without compiling any Wasm:
 ```bash
 cd ~/regalloc2/regicide
 RUST_LOG=trace cargo run --all-features --example run -- \
-    ../reports/codegen-analysis-001/corpus/bz2-0003-foo.postcard
+    ../$R/corpus/bz2-0003-foo.postcard
 ```
 
 Narrow it the same way as `WASMTIME_LOG`, e.g.
